@@ -22,6 +22,7 @@ process.on('uncaughtException', (err) => {
 let _setZaloApi: ((api: Awaited<ReturnType<typeof getZaloApi>>) => void) | null = null;
 let _reconnectInProgress = false;
 let _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let _keepAliveInterval: ReturnType<typeof setInterval> | null = null;
 let _activeZaloApi: Awaited<ReturnType<typeof getZaloApi>> | null = null;
 let _bridgeReadyAnnounced = false;
 
@@ -50,6 +51,19 @@ async function startZalo(
   api: Awaited<ReturnType<typeof getZaloApi>>,
   isReconnect = false,
 ): Promise<void> {
+  // Stop existing listener and clear keepalive if replacing API
+  if (_activeZaloApi && _activeZaloApi !== api) {
+    try {
+      _activeZaloApi.listener.stop();
+    } catch (err) {
+      console.warn('[Boot] Failed stopping old Zalo listener:', err);
+    }
+  }
+  if (_keepAliveInterval) {
+    clearInterval(_keepAliveInterval);
+    _keepAliveInterval = null;
+  }
+
   _activeZaloApi = api;
   if (!isReconnect) void pruneLeftGroupTopics(api);
   await setupZaloHandler(api);
@@ -69,6 +83,23 @@ async function startZalo(
   }
   api.listener.start();
   terminal.status('zalo', `listener ${isReconnect ? 're' : ''}started`, 'success');
+
+  // Start periodic session keepAlive every 2 minutes
+  _keepAliveInterval = setInterval(() => {
+    if (_activeZaloApi) {
+      void (async () => {
+        try {
+          const rawApi = _activeZaloApi as unknown as Record<string, () => Promise<unknown>>;
+          if (typeof rawApi.keepAlive === 'function') {
+            await rawApi.keepAlive();
+          }
+        } catch (err) {
+          console.warn('[Boot] Zalo keepAlive check warning:', err);
+        }
+      })();
+    }
+  }, 2 * 60 * 1000);
+  
   if (!_bridgeReadyAnnounced) {
     _bridgeReadyAnnounced = true;
     terminal.status('bridge', 'ready · forwarding active', 'success');
@@ -183,6 +214,10 @@ async function main(): Promise<void> {
     if (_reconnectTimer) {
       clearTimeout(_reconnectTimer);
       _reconnectTimer = null;
+    }
+    if (_keepAliveInterval) {
+      clearInterval(_keepAliveInterval);
+      _keepAliveInterval = null;
     }
     try { _activeZaloApi?.listener.stop(); } catch { /* ignore */ }
     try { await tgBot.stop(reason); } catch { /* bot may not have launched yet */ }
