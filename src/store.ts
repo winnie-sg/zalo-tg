@@ -21,13 +21,15 @@ export interface TopicEntry {
   zaloId:  string;   // threadId (UID for DMs, groupId for groups)
   type:    0 | 1;    // 0 = ThreadType.User, 1 = ThreadType.Group
   name:    string;   // contact name or group name
+  paused?: boolean;  // true if message forwarding to this topic is paused
 }
 
 interface StoreData {
   /** topicId (as string key) → entry */
-  topics:    Record<string, TopicEntry>;
+  topics:          Record<string, TopicEntry>;
   /** `${type}:${zaloId}` → topicId */
-  zaloIndex: Record<string, number>;
+  zaloIndex:       Record<string, number>;
+  excludedGroups?: string[];
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────────
@@ -35,11 +37,13 @@ interface StoreData {
 const filePath = path.resolve(config.dataDir, 'topics.json');
 
 function load(): StoreData {
-  if (!existsSync(filePath)) return { topics: {}, zaloIndex: {} };
+  if (!existsSync(filePath)) return { topics: {}, zaloIndex: {}, excludedGroups: [] };
   try {
-    return JSON.parse(readFileSync(filePath, 'utf8')) as StoreData;
+    const loaded = JSON.parse(readFileSync(filePath, 'utf8')) as StoreData;
+    if (!loaded.excludedGroups) loaded.excludedGroups = [];
+    return loaded;
   } catch {
-    return { topics: {}, zaloIndex: {} };
+    return { topics: {}, zaloIndex: {}, excludedGroups: [] };
   }
 }
 
@@ -71,9 +75,6 @@ export const store = {
 
   /** Persist a new topic ↔ Zalo mapping. */
   set(entry: TopicEntry): void {
-    // Keep the two indexes strictly one-to-one. Reusing a Telegram topic for a
-    // different Zalo thread must remove the old reverse lookup, and remapping a
-    // Zalo thread to a new topic must remove the stale topic entry.
     const previousAtTopic = _data.topics[String(entry.topicId)];
     if (previousAtTopic) {
       const previousKey = zaloKey(previousAtTopic.zaloId, previousAtTopic.type);
@@ -94,12 +95,54 @@ export const store = {
     persist(_data);
   },
 
-  /** Update the stored display name for an existing topic mapping. */
+  /** Update stored display name for an existing topic mapping. */
   updateName(topicId: number, name: string): void {
     const entry = _data.topics[String(topicId)];
     if (!entry || entry.name === name) return;
     entry.name = name;
     persist(_data);
+  },
+
+  /** Set pause status for a topic. */
+  setPaused(topicId: number, paused: boolean): boolean {
+    const entry = _data.topics[String(topicId)];
+    if (!entry) return false;
+    entry.paused = paused;
+    persist(_data);
+    return true;
+  },
+
+  /** Check if a Zalo ID is in the exclusion list (via ENV or store). */
+  isExcluded(zaloId: string): boolean {
+    const envExcluded = config.zalo.excludedGroups ?? [];
+    if (envExcluded.includes(zaloId)) return true;
+    return (_data.excludedGroups ?? []).includes(zaloId);
+  },
+
+  /** Add a Zalo ID to the exclusion list. */
+  exclude(zaloId: string): void {
+    if (!_data.excludedGroups) _data.excludedGroups = [];
+    if (!_data.excludedGroups.includes(zaloId)) {
+      _data.excludedGroups.push(zaloId);
+      persist(_data);
+    }
+  },
+
+  /** Remove a Zalo ID from the exclusion list. */
+  unexclude(zaloId: string): void {
+    if (!_data.excludedGroups) return;
+    const idx = _data.excludedGroups.indexOf(zaloId);
+    if (idx !== -1) {
+      _data.excludedGroups.splice(idx, 1);
+      persist(_data);
+    }
+  },
+
+  /** Get all excluded Zalo IDs. */
+  allExcluded(): string[] {
+    const envExcluded = config.zalo.excludedGroups ?? [];
+    const storeExcluded = _data.excludedGroups ?? [];
+    return Array.from(new Set([...envExcluded, ...storeExcluded]));
   },
 
   /** All entries (for diagnostics). */
@@ -125,9 +168,13 @@ export const store = {
     _data = load();
   },
 
-  stats(): { topics: number; sizeBytes: number } {
+  stats(): { topics: number; excluded: number; sizeBytes: number } {
     const raw = JSON.stringify(_data);
-    return { topics: Object.keys(_data.topics).length, sizeBytes: raw.length };
+    return {
+      topics: Object.keys(_data.topics).length,
+      excluded: (_data.excludedGroups ?? []).length,
+      sizeBytes: raw.length,
+    };
   },
 };
 
