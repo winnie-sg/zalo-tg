@@ -41,7 +41,7 @@ import type { ZaloAPI, ZaloMessage } from '../zalo/types.js';
 import { ZALO_MSG_TYPES } from '../zalo/types.js';
 import { store, msgStore, userCache, friendsCache, groupsCache, sentMsgStore, pollStore, mediaGroupStore, reactionEchoStore, reactionSummaryStore, reactionEventDedupeStore, aliasCache, markRecalled, type ZaloQuoteData } from '../store.js';
 import { getAutoReplyState, setAutoReplyEnabled, AUTO_REPLY_COOLDOWN_MIN, AUTO_REPLY_MAX_PER_HOUR } from '../zalo/autoReply.js';
-import { replayHistoryMessages, requestGroupHistory } from '../zalo/handler.js';
+import { replayHistoryMessages, requestGroupHistory, queueGroupMemberScan } from '../zalo/handler.js';
 import { tgBot } from './bot.js';
 import { config } from '../config.js';
 import { downloadToTemp, cleanTemp, convertStickerToPng, convertTgsToGif, convertToM4a, extractVideoThumbnail, convertWebmToGif } from '../utils/media.js';
@@ -246,6 +246,47 @@ function buildTopicUrl(topicId: number): string {
   const chatId = String(config.telegram.groupId);
   const internalChatId = chatId.startsWith('-100') ? chatId.slice(4) : chatId.replace(/^-/, '');
   return `https://t.me/c/${internalChatId}/${topicId}`;
+}
+
+/** Fetch optional profile details for a Zalo user (DOB, friend status). */
+async function fetchUserExtraDetails(api: ZaloAPI, uid: string): Promise<{ dob?: string; friendStatus?: string }> {
+  let dob: string | undefined;
+  let friendStatus: string | undefined;
+
+  try {
+    const status = (await api.getFriendRequestStatus(uid) as unknown) as {
+      is_friend?: boolean | number;
+      is_requesting?: boolean | number;
+      is_requested?: boolean | number;
+    } | undefined;
+
+    if (status?.is_friend) friendStatus = '✅ Bạn bè';
+    else if (status?.is_requesting) friendStatus = '⏳ Đang chờ chấp nhận';
+    else if (status?.is_requested) friendStatus = '📩 Đã gửi lời mời';
+    else if (status !== undefined) friendStatus = '👤 Chưa kết bạn';
+  } catch {
+    /* ignore error */
+  }
+
+  try {
+    const infoResp = (await api.getUserInfo(uid) as unknown) as {
+      changed_profiles?: Record<string, { sdob?: string | number; dob?: string | number; birthday?: string | number }>;
+      unchanged_profiles?: Record<string, { sdob?: string | number; dob?: string | number; birthday?: string | number }>;
+    } | undefined;
+
+    const uidKey = uid.includes('_') ? uid : uid + '_0';
+    const profile = infoResp?.changed_profiles?.[uidKey]
+      ?? infoResp?.changed_profiles?.[uid]
+      ?? infoResp?.unchanged_profiles?.[uidKey]
+      ?? infoResp?.unchanged_profiles?.[uid];
+
+    const rawDob = profile?.sdob || profile?.dob || profile?.birthday;
+    if (rawDob) dob = String(rawDob);
+  } catch {
+    /* ignore error */
+  }
+
+  return { dob, friendStatus };
 }
 
 async function isTelegramGroupAdmin(userId: number): Promise<boolean> {
@@ -575,9 +616,58 @@ export function setupTelegramHandler(
         await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Topic này chưa được map.', replyOpts);
         return;
       }
+      const isPaused = entry.paused ? ' (⏸️ Đang tạm dừng)' : ' (▶️ Đang hoạt động)';
+      const isExcluded = store.isExcluded(entry.zaloId) ? ' [🚫 Trong danh sách loại trừ]' : '';
       await ctx.telegram.sendMessage(
         config.telegram.groupId,
-        `ℹ️ <b>${entry.name}</b>\nzaloId: <code>${entry.zaloId}</code>\ntype: ${entry.type === 1 ? 'group' : 'dm'}`,
+        `ℹ️ <b>${entry.name}</b>\nzaloId: <code>${entry.zaloId}</code>\ntype: ${entry.type === 1 ? 'group' : 'dm'}\ntrạng thái: ${isPaused}${isExcluded}`,
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    if (arg === 'pause') {
+      const entry = store.getEntryByTopic(topicId);
+      if (!entry) {
+        await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Topic này chưa được map.', replyOpts);
+        return;
+      }
+      store.setPaused(topicId, true);
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        `⏸️ Đã tạm dừng nhận tin nhắn cho topic: <b>${entry.name}</b>`,
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    if (arg === 'resume') {
+      const entry = store.getEntryByTopic(topicId);
+      if (!entry) {
+        await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Topic này chưa được map.', replyOpts);
+        return;
+      }
+      store.setPaused(topicId, false);
+      store.unexclude(entry.zaloId);
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        `▶️ Đã tiếp tục nhận tin nhắn cho topic: <b>${entry.name}</b>`,
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    if (arg === 'exclude') {
+      const entry = store.getEntryByTopic(topicId);
+      if (!entry) {
+        await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Topic này chưa được map.', replyOpts);
+        return;
+      }
+      store.exclude(entry.zaloId);
+      store.remove(topicId);
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        `🚫 Đã loại trừ và xoá topic: <b>${entry.name}</b> (zaloId=<code>${entry.zaloId}</code>). Sẽ không nhận tin nhắn mới trừ khi được thêm lại thủ công.`,
         { ...replyOpts, parse_mode: 'HTML' },
       );
       return;
@@ -589,9 +679,11 @@ export function setupTelegramHandler(
         await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Topic này chưa được map.', replyOpts);
         return;
       }
+      // Per user choice: deleting topic adds to exclusion list so it doesn't auto-recreate
+      store.exclude(removed.zaloId);
       await ctx.telegram.sendMessage(
         config.telegram.groupId,
-        `🗑️ Đã xoá mapping: <b>${removed.name}</b> (zaloId=${removed.zaloId})`,
+        `🗑️ Đã xoá mapping & chuyển vào danh sách bỏ qua: <b>${removed.name}</b> (zaloId=<code>${removed.zaloId}</code>). Để nhận lại tin nhắn, hãy thêm lại bằng <code>/addgroup</code>.`,
         { ...replyOpts, parse_mode: 'HTML' },
       );
       return;
@@ -599,7 +691,7 @@ export function setupTelegramHandler(
 
     await ctx.telegram.sendMessage(
       config.telegram.groupId,
-      '❓ Dùng: <code>/topic list</code> | <code>/topic info</code> | <code>/topic delete</code>',
+      '❓ Dùng: <code>/topic list</code> | <code>/topic info</code> | <code>/topic pause</code> | <code>/topic resume</code> | <code>/topic exclude</code> | <code>/topic delete</code>',
       { ...replyOpts, parse_mode: 'HTML' },
     );
   });
@@ -969,6 +1061,7 @@ export function setupTelegramHandler(
     if (!currentApi) { await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Zalo chưa kết nối', replyOpts); return; }
 
     const phoneQuery = normalizePhoneSearchQuery(query);
+
     if (phoneQuery) {
       try {
         const user = await currentApi.findUser(phoneQuery) as {
@@ -992,10 +1085,15 @@ export function setupTelegramHandler(
           ? { text: `👤 ${displayName} ✅`, callback_data: `sc:${user.uid}` }
           : { text: `👤 ${displayName}`, callback_data: `sc:${user.uid}` };
 
+        const { dob, friendStatus } = await fetchUserExtraDetails(currentApi, user.uid);
+        const extraLines: string[] = [];
+        if (friendStatus) extraLines.push(`• Trạng thái: ${friendStatus}`);
+        if (dob) extraLines.push(`• Năm sinh/Ngày sinh: <b>${escapeHtml(dob)}</b>`);
+        const detailsText = extraLines.length > 0 ? `\n${extraLines.join('\n')}\n` : '\n';
+
         await ctx.telegram.sendMessage(
           config.telegram.groupId,
-          `📱 Tìm thấy theo số <b>${phoneQuery}</b>:
-
+          `📱 Tìm thấy theo số <b>${phoneQuery}</b>: <b>${escapeHtml(displayName)}</b>${detailsText}
 ✅ = đã có topic • Nhấn để mở nếu đã map, hoặc tạo nếu chưa có`,
           {
             ...replyOpts,
@@ -1097,6 +1195,24 @@ export function setupTelegramHandler(
       return;
     }
 
+// Enrich the top 5 friend results with DOB and friend status (limit API calls)
+    const dobMap = new Map<string, string>();
+    const friendStatusMap = new Map<string, string>();
+    if (currentApi) {
+      const api = currentApi;
+      const topFriends = friendResults.slice(0, 5);
+      const detailResults = await Promise.allSettled(
+        topFriends.map(f => fetchUserExtraDetails(api, f.userId)),
+      );
+      for (let i = 0; i < topFriends.length; i++) {
+        const res = detailResults[i];
+        if (res?.status === 'fulfilled') {
+          if (res.value.dob) dobMap.set(topFriends[i].userId, res.value.dob);
+          if (res.value.friendStatus) friendStatusMap.set(topFriends[i].userId, res.value.friendStatus);
+        }
+      }
+    }
+
     const buttons: Array<Array<{ text: string; callback_data: string } | { text: string; url: string }>> = [];
     for (const f of friendResults) {
       const existingTopicId = store.getTopicByZalo(f.userId, 0);
@@ -1113,8 +1229,19 @@ export function setupTelegramHandler(
     }
 
     const parts: string[] = [`🔍 Kết quả "<b>${query}</b>":`, ''];
-    if (friendResults.length > 0) parts.push(`👤 <b>Bạn bè</b> (${friendResults.length}):`);
-    if (groupResults.length > 0)  parts.push(`👥 <b>Nhóm</b> (${groupResults.length}):`);
+    if (friendResults.length > 0) {
+      parts.push(`👤 <b>Bạn bè</b> (${friendResults.length}):`);
+      for (const f of friendResults) {
+        const dob = dobMap.get(f.userId);
+        const friendStatus = friendStatusMap.get(f.userId);
+        const extra = [];
+        if (dob) extra.push(`🎂 <code>${escapeHtml(dob)}</code>`);
+        if (friendStatus) extra.push(friendStatus);
+        const suffix = extra.length > 0 ? ` — ${extra.join(' • ')}` : '';
+        parts.push(`• ${escapeHtml(aliasCache.label(f.userId, f.displayName))}${suffix}`);
+      }
+    }
+    if (groupResults.length > 0)  parts.push(`\n👥 <b>Nhóm</b> (${groupResults.length}):`);
     parts.push('', '✅ = đã có topic • Nhấn để mở nếu đã map, hoặc tạo nếu chưa có');
 
     await ctx.telegram.sendMessage(
@@ -2022,6 +2149,12 @@ export function setupTelegramHandler(
         }
       }
       if (topicAlive) {
+        // Trigger member rescan when opening an existing group topic
+        if (isGroup && currentApi) {
+          const api = currentApi;
+          console.log(`[Rescan] Triggering member scan for group ${entityId} on topic open`);
+          queueGroupMemberScan(api, entityId, true);
+        }
         await ctx.answerCbQuery('ℹ️ Topic đã tồn tại');
         return;
       }
@@ -2071,6 +2204,13 @@ export function setupTelegramHandler(
       const topicId = topic.message_thread_id;
       store.set({ topicId, zaloId: entityId, type: threadType, name: displayName });
       console.log(`[search/cb] Created ${isGroup ? 'group' : 'DM'} topic "${displayName}" (topicId=${topicId})`);
+
+      // Trigger member rescan for newly created group topics
+      if (isGroup && currentApi) {
+        const api = currentApi;
+        console.log(`[Rescan] Triggering member scan for new group ${entityId}`);
+        queueGroupMemberScan(api, entityId, true);
+      }
 
       await ctx.answerCbQuery('✅ Đã tạo topic!');
       await ctx.telegram.sendMessage(
