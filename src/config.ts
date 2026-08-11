@@ -64,6 +64,7 @@ export const config = {
     // Telegram (messages still arrive, just no ping). On by default; set
     // ZALO_MUTE_SILENT=0 to always notify.
     muteSilentMirror: envFlag('ZALO_MUTE_SILENT', true),
+    excludedGroups: (process.env.ZALO_EXCLUDED_GROUPS ?? '').split(',').map(s => s.trim()).filter(Boolean),
   },
   dataDir: resolvePath(process.env.DATA_DIR, 'data'),
 } as const;
