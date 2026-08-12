@@ -19,6 +19,11 @@
 services:
   telegram-bot-api:
     image: aiogram/telegram-bot-api:latest
+    container_name: telegram-bot-api
+    hostname: telegram-bot-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${TG_LOCAL_PORT:-8081}:8081"
     environment:
       TELEGRAM_API_ID:   "${TG_API_ID}"
       TELEGRAM_API_HASH: "${TG_API_HASH}"
@@ -36,10 +41,7 @@ services:
       - /tmp:/tmp
       # Explicit nested bind makes Docker create the work directory before the
       # image entrypoint tries to chown it on a fresh machine.
-      - /tmp/telegram-bot-api:/tmp/telegram-bot-api
-    ports:
-      - "${TG_LOCAL_PORT:-8081}:8081"
-    restart: unless-stopped
+      - /tmp/telegram-bot-api:/tmp/telegram-bot-api    
     healthcheck:
       # Bot API intentionally returns 404 at `/`; probe the listening socket
       # instead of treating that valid response as an unhealthy container.
@@ -51,6 +53,7 @@ services:
   zalo-tg:
     image: ghcr.io/winnie-sg/zalo-tg:latest
     container_name: zalo-tg
+    hostname: zalo-tg
     restart: unless-stopped
     env_file:
       - .env
