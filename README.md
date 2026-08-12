@@ -1,10 +1,9 @@
 # Zalo ↔ Telegram Bridge
 
-[![CI](https://github.com/williamcachamwri/zalo-tg/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/williamcachamwri/zalo-tg/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/github/package-json/v/williamcachamwri/zalo-tg?label=version)](https://github.com/williamcachamwri/zalo-tg)
+[![Version](https://img.shields.io/github/package-json/v/winnie-sg/zalo-tg?label=version)](https://github.com/winnie-sg/zalo-tg)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20.11-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.4-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![Last commit](https://img.shields.io/github/last-commit/williamcachamwri/zalo-tg)](https://github.com/williamcachamwri/zalo-tg/commits/main)
+[![Last commit](https://img.shields.io/github/last-commit/winnie-sg/zalo-tg)](https://github.com/winnie-sg/zalo-tg/commits/main)
 
 > A TypeScript bridge that mirrors Zalo direct messages and groups into Telegram forum topics, and sends replies from Telegram back to the correct Zalo conversation.
 
