@@ -99,9 +99,15 @@ Copy [.env.example](.env.example) for the full template. Complete configuration 
 | `TG_TOKEN` | required | app | Telegram bot token from @BotFather. |
 | `TG_GROUP_ID` | required, e.g. `-1001234567890` | app | Telegram supergroup/forum ID. Must be negative; bot must be admin and Topics must be enabled. |
 | `DATA_DIR` | `./data` | app | Persistent store directory for topics, message maps, user cache, polls and auto-reply state. |
+| `LOG_DIR` | `./logs` | app | Root folder for daily, level-separated bridge logs. |
+| `LOG_LEVEL` | `info` | app | Minimum persisted level: `debug`, `info`, `warn` or `error`. Files are stored under `LOG_DIR/dd-MM-yyyy/`. |
 | `ZALO_CREDENTIALS_PATH` | `./credentials.json` | app | Zalo login credentials written after QR login. Keep private. |
 | `ZALO_SKIP_MUTED_GROUPS` | `0` | app | `1` skips messages from muted Zalo groups entirely. |
 | `ZALO_MUTE_SILENT` | `1` | app | `1` mirrors Zalo muted threads as silent Telegram messages; `0` always notifies. |
+| `ZALO_DM_NATIVE_REACTION` | `1` | app | `1` attaches DM reactions natively to Telegram messages; `0` uses summary replies. |
+| `ZALO_EXCLUDE_THREADS` | empty | app | Comma-separated `type:id` list of threads to ignore (e.g. `0:123456,1:789012`). |
+| `MAGIKA_BLOCK_DISGUISED` | `1` | app | `1` enables AI payload verification using Google Magika; blocks disguised files in both directions. |
+| `MAGIKA_CONFIDENCE_THRESHOLD` | `0.85` | app | Minimum Magika AI prediction confidence (0.00–1.00) required to trigger an active block. |
 | `LOCAL_BOT_API` | `0` | app | `1` sends Telegram Bot API calls to `TG_LOCAL_SERVER`; `0` uses official `api.telegram.org`. |
 | `TG_LOCAL_SERVER` | `http://127.0.0.1:8081` | app / Compose override | Local Bot API endpoint. Required only when `LOCAL_BOT_API=1`; Compose overrides it to `http://telegram-bot-api:8081`. |
 | `TG_API_ID` | empty | Docker Compose | Telegram API ID for the `telegram-bot-api` container; get it from my.telegram.org. |

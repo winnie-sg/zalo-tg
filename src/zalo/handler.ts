@@ -15,9 +15,10 @@ import { config } from '../config.js';
 import { downloadToTemp, downloadToTempFromCandidates, cleanTemp, convertSpriteSheetToGif, sanitizeFileName, telegramMediaBatches } from '../utils/media.js';
 import { applyZaloMarkupHtml, formatGroupMsgHtml, formatGroupMsg, groupCaption, topicName, truncate, escapeHtml } from '../utils/format.js';
 import type { ZaloStyle } from '../utils/format.js';
-import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, reactionEchoStore, reactionSummaryStore, reactionEventDedupeStore, aliasCache, friendsCache, recentlyRecalledMsgIds, type ZaloQuoteData } from '../store.js';
+import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, reactionEchoStore, reactionSummaryStore, reactionEventDedupeStore, aliasCache, friendsCache, recentlyRecalledMsgIds, recallNotifiedStore, type ZaloQuoteData } from '../store.js';
 import { tgQueue } from '../utils/tgQueue.js';
 import { maybeAutoReply } from './autoReply.js';
+import { inspectFileSecurity, pendingSecurityStore } from '../utils/fileSecurity.js';
 
 // Proxy that routes every tg.* call through the rate-limit queue
 // so 429 errors are auto-retried instead of crashing the process.
@@ -729,6 +730,24 @@ function buildScoreText(header: string, options: Pick<PollOptions, 'content' | '
   return `📊 <b>${escapeHtml(header)}</b>${status}\n\nTổng: ${total} phiếu\n\n${lines.join('\n\n')}`;
 }
 
+/**
+ * Returns true if the error is a media-download failure (axios ETIMEDOUT,
+ * ECONNRESET, etc.) — i.e. the CDN was unreachable after all retries.
+ * Used in the top-level catch to send a user-facing notification instead of
+ * silently dropping the message.
+ */
+function isDownloadError(err: unknown): boolean {
+  if (err == null || typeof err !== 'object') return false;
+  const e = err as Record<string, unknown>;
+  // AxiosError carries .isAxiosError and .code directly
+  if (e.isAxiosError === true) return true;
+  const code = typeof e.code === 'string' ? e.code : '';
+  if (['ETIMEDOUT', 'ECONNRESET', 'ENOTFOUND', 'ECONNREFUSED', 'ECONNABORTED'].includes(code)) return true;
+  // Nested cause (AggregateError wrapping ETIMEDOUT)
+  if (e.cause != null && isDownloadError(e.cause)) return true;
+  return false;
+}
+
 // ── Main handler ─────────────────────────────────────────────────────────────
 
 /** Track which groups already had their member cache populated this session.
@@ -929,7 +948,7 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       const senderName = msg.isSelf ? 'Bạn' : (msg.data.dName ?? msg.data.uidFrom);
       const msgType    = msg.data.msgType ?? ZALO_MSG_TYPES.TEXT;
 
-      if (store.isExcluded(zaloId)) {
+      if (store.isExcluded(zaloId) || config.zalo.excludeThreads[`${type}:${zaloId}`]) {
         console.log(`[Zalo→TG] Skip excluded thread/group ${zaloId}`);
         return;
       }
@@ -1205,6 +1224,22 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
                 `photo_${Date.now()}.jpg`,
               );
               try {
+                const sec = await inspectFileSecurity(localPath, 'photo.jpg');
+                if (!sec.safe) {
+                  console.warn(`[SECURITY] Blocked disguised photo from Zalo (sender: ${buf.senderName}) -> detected ${sec.detectedType}`);
+                  await tg.sendMessage(
+                    config.telegram.groupId,
+                    `⚠️ <b>[Cảnh báo bảo mật] Đã chặn ảnh giả mạo từ Zalo</b>\n\n` +
+                    `• <b>Người gửi:</b> ${escapeHtml(buf.senderName)}\n` +
+                    `• <b>Tệp:</b> <code>photo.jpg</code>\n` +
+                    `• <b>Loại thực tế:</b> <code>${escapeHtml(sec.detectedType ?? 'unknown')}</code> (${((sec.confidence ?? 0) * 100).toFixed(1)}%)\n` +
+                    `• <b>Lý do:</b> ${escapeHtml(sec.reason ?? 'Nội dung tệp không hợp lệ')}\n` +
+                    `• <b>SHA-256:</b> <code>${sec.sha256 ?? 'n/a'}</code>`,
+                    { ...buf.tgBase, parse_mode: 'HTML' },
+                  ).catch(() => {});
+                  return;
+                }
+
                 const sent = await withLocalMediaFallback(
                   forceMultipart => tg.sendPhoto(
                     config.telegram.groupId,
@@ -1234,11 +1269,31 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
                     `photo_${Date.now()}.jpg`,
                   ));
                 const dlResults = await Promise.allSettled(dlPromises);
-                const downloaded = dlResults.flatMap((r, index) => {
-                  if (r.status === 'fulfilled') return [{ localPath: r.value, item: buf.items[index]! }];
-                  console.warn('[ZaloHandler] Album: skipping failed photo download:', r.reason);
-                  return [];
-                });
+                const downloaded: { localPath: string; item: typeof buf.items[number] }[] = [];
+                for (let index = 0; index < dlResults.length; index++) {
+                  const r = dlResults[index]!;
+                  if (r.status !== 'fulfilled') {
+                    console.warn('[ZaloHandler] Album: skipping failed photo download:', r.reason);
+                    continue;
+                  }
+                  const lp = r.value;
+                  const sec = await inspectFileSecurity(lp, 'photo.jpg');
+                  if (!sec.safe) {
+                    console.warn(`[SECURITY] Album: blocked disguised photo from Zalo -> detected ${sec.detectedType}`);
+                    await tg.sendMessage(
+                      config.telegram.groupId,
+                      `⚠️ <b>[Cảnh báo bảo mật] Đã bỏ qua ảnh giả mạo trong album Zalo</b>\n\n` +
+                      `• <b>Người gửi:</b> ${escapeHtml(buf.senderName)}\n` +
+                      `• <b>Loại thực tế:</b> <code>${escapeHtml(sec.detectedType ?? 'unknown')}</code> (${((sec.confidence ?? 0) * 100).toFixed(1)}%)\n` +
+                      `• <b>Lý do:</b> ${escapeHtml(sec.reason ?? 'Nội dung tệp không hợp lệ')}\n` +
+                      `• <b>SHA-256:</b> <code>${sec.sha256 ?? 'n/a'}</code>`,
+                      { ...buf.tgBase, parse_mode: 'HTML' },
+                    ).catch(() => {});
+                    await cleanTemp(lp);
+                    continue;
+                  }
+                  downloaded.push({ localPath: lp, item: buf.items[index]! });
+                }
                 if (downloaded.length === 0) return;
                 localPaths.push(...downloaded.map(d => d.localPath));
                 const captionText = buf.caption
@@ -1314,8 +1369,22 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
         const url = media.href || media.thumb;
         if (!url) { console.warn('[ZaloHandler] Doodle: no URL'); return; }
         const localPath = await downloadToTemp(url, `doodle_${Date.now()}.jpg`);
-        const stream = createReadStream(localPath);
         try {
+          const sec = await inspectFileSecurity(localPath, 'doodle.jpg');
+          if (!sec.safe) {
+            console.warn(`[SECURITY] Blocked disguised doodle from Zalo (sender: ${bridgeSenderName}) -> detected ${sec.detectedType}`);
+            await tg.sendMessage(
+              config.telegram.groupId,
+              `⚠️ <b>[Cảnh báo bảo mật] Đã chặn hình vẽ giả mạo từ Zalo</b>\n\n` +
+              `• <b>Người gửi:</b> ${escapeHtml(bridgeSenderName)}\n` +
+              `• <b>Loại thực tế:</b> <code>${escapeHtml(sec.detectedType ?? 'unknown')}</code> (${((sec.confidence ?? 0) * 100).toFixed(1)}%)\n` +
+              `• <b>Lý do:</b> ${escapeHtml(sec.reason ?? 'Nội dung hình ảnh không hợp lệ')}\n` +
+              `• <b>SHA-256:</b> <code>${sec.sha256 ?? 'n/a'}</code>`,
+              { ...tgBase, parse_mode: 'HTML' },
+            ).catch(() => {});
+            return;
+          }
+          const stream = createReadStream(localPath);
           const sent = await tg.sendPhoto(config.telegram.groupId, { source: stream }, tgOpts);
           saveTgMapping(sent);
         } finally { await cleanTemp(localPath); }
@@ -1332,6 +1401,20 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
         const ext = path.extname(url.split('?')[0] ?? '').toLowerCase() || '.mp4';
         const localPath = await (earlyDlPromise ?? downloadToTemp(url, `gif_${Date.now()}${ext}`));
         try {
+          const sec = await inspectFileSecurity(localPath, `gif${ext}`);
+          if (!sec.safe) {
+            console.warn(`[SECURITY] Blocked disguised GIF from Zalo (sender: ${bridgeSenderName}) -> detected ${sec.detectedType}`);
+            await tg.sendMessage(
+              config.telegram.groupId,
+              `⚠️ <b>[Cảnh báo bảo mật] Đã chặn GIF giả mạo từ Zalo</b>\n\n` +
+              `• <b>Người gửi:</b> ${escapeHtml(bridgeSenderName)}\n` +
+              `• <b>Loại thực tế:</b> <code>${escapeHtml(sec.detectedType ?? 'unknown')}</code> (${((sec.confidence ?? 0) * 100).toFixed(1)}%)\n` +
+              `• <b>Lý do:</b> ${escapeHtml(sec.reason ?? 'Nội dung GIF không hợp lệ')}\n` +
+              `• <b>SHA-256:</b> <code>${sec.sha256 ?? 'n/a'}</code>`,
+              { ...tgBase, parse_mode: 'HTML' },
+            ).catch(() => {});
+            return;
+          }
           const sent = await sendAnimationWithFallback(
             localPath,
             tgOpts,
@@ -1353,15 +1436,71 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
           return;
         }
         const localPath = await (earlyDlPromise ?? downloadToTemp(url, fileName));
-        const stream = createReadStream(localPath);
+        let isPending = false;
         try {
+          const sec = await inspectFileSecurity(localPath, fileName);
+          if (sec.requiresApproval) {
+            isPending = true;
+            console.warn(`[SECURITY] Inbound Zalo file requires approval: "${fileName}" (sender: ${bridgeSenderName}) -> detected ${sec.detectedType}`);
+            const pending = pendingSecurityStore.add({
+              direction: 'zalo_to_tg',
+              filename: fileName,
+              localPath,
+              topicId,
+              zaloId,
+              threadType: type,
+              secCheck: sec,
+              executeApprove: async () => {
+                const stream = createReadStream(localPath);
+                const sent = await tg.sendDocument(
+                  config.telegram.groupId,
+                  { source: stream, filename: sanitizeFileName(fileName) },
+                  tgOpts,
+                );
+                saveTgMapping(sent);
+              },
+              executeDeny: async () => {
+                await cleanTemp(localPath);
+              },
+            });
+
+            await tg.sendMessage(
+              config.telegram.groupId,
+              `⚠️ <b>[Cảnh báo bảo mật tệp nhận từ Zalo]</b>\n\n` +
+              `• <b>Người gửi:</b> ${escapeHtml(bridgeSenderName)}\n` +
+              `• <b>Tệp:</b> <code>${escapeHtml(fileName)}</code>\n` +
+              `• <b>Loại khai báo:</b> <code>${escapeHtml(sec.declaredType ?? 'unknown')}</code>\n` +
+              `• <b>Loại thực tế phát hiện:</b> <code>${escapeHtml(sec.detectedType ?? 'unknown')}</code> (${((sec.confidence ?? 0) * 100).toFixed(1)}%)\n` +
+              `• <b>Lý do:</b> ${escapeHtml(sec.reason ?? 'Nội dung tệp không khớp với phần mở rộng')}\n` +
+              `• <b>SHA-256:</b> <code>${sec.sha256 ?? 'n/a'}</code>\n\n` +
+              `<i>Quản trị viên vui lòng chọn phê duyệt để tải tệp lên Telegram hoặc huỷ bỏ:</i>`,
+              {
+                ...tgBase,
+                parse_mode: 'HTML',
+                reply_markup: {
+                  inline_keyboard: [
+                    [
+                      { text: '✅ Cho phép tải lên Telegram', callback_data: `sec_appr:${pending.id}` },
+                      { text: '❌ Bỏ qua & Xoá tệp', callback_data: `sec_deny:${pending.id}` },
+                    ],
+                  ],
+                },
+              },
+            ).catch(() => {});
+            return;
+          }
+          const stream = createReadStream(localPath);
           const sent = await tg.sendDocument(
             config.telegram.groupId,
             { source: stream, filename: sanitizeFileName(fileName) },
             tgOpts,
           );
           saveTgMapping(sent);
-        } finally { await cleanTemp(localPath); }
+        } finally {
+          if (!isPending) {
+            await cleanTemp(localPath);
+          }
+        }
         return;
       }
 
@@ -1370,8 +1509,22 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
         const url = media.href;
         if (!url) { console.warn('[ZaloHandler] Video: no URL found in content:', media); return; }
         const localPath = await (earlyDlPromise ?? downloadToTemp(url, `video_${Date.now()}.mp4`));
-        const stream = createReadStream(localPath);
         try {
+          const sec = await inspectFileSecurity(localPath, 'video.mp4');
+          if (!sec.safe) {
+            console.warn(`[SECURITY] Blocked disguised video from Zalo (sender: ${bridgeSenderName}) -> detected ${sec.detectedType}`);
+            await tg.sendMessage(
+              config.telegram.groupId,
+              `⚠️ <b>[Cảnh báo bảo mật] Đã chặn video giả mạo từ Zalo</b>\n\n` +
+              `• <b>Người gửi:</b> ${escapeHtml(bridgeSenderName)}\n` +
+              `• <b>Loại thực tế:</b> <code>${escapeHtml(sec.detectedType ?? 'unknown')}</code> (${((sec.confidence ?? 0) * 100).toFixed(1)}%)\n` +
+              `• <b>Lý do:</b> ${escapeHtml(sec.reason ?? 'Nội dung video không hợp lệ')}\n` +
+              `• <b>SHA-256:</b> <code>${sec.sha256 ?? 'n/a'}</code>`,
+              { ...tgBase, parse_mode: 'HTML' },
+            ).catch(() => {});
+            return;
+          }
+          const stream = createReadStream(localPath);
           const sent = await tg.sendVideo(config.telegram.groupId, { source: stream }, tgOpts);
           saveTgMapping(sent);
         } finally { await cleanTemp(localPath); }
@@ -1384,8 +1537,22 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
         if (!url) { console.warn('[ZaloHandler] Voice: no URL found in content:', media); return; }
         const ext = path.extname(url.split('?')[0] ?? '').toLowerCase() || '.m4a';
         const localPath = await (earlyDlPromise ?? downloadToTemp(url, `voice_${Date.now()}${ext}`));
-        const stream = createReadStream(localPath);
         try {
+          const sec = await inspectFileSecurity(localPath, `voice${ext}`);
+          if (!sec.safe) {
+            console.warn(`[SECURITY] Blocked disguised voice from Zalo (sender: ${bridgeSenderName}) -> detected ${sec.detectedType}`);
+            await tg.sendMessage(
+              config.telegram.groupId,
+              `⚠️ <b>[Cảnh báo bảo mật] Đã chặn tin nhắn thoại giả mạo từ Zalo</b>\n\n` +
+              `• <b>Người gửi:</b> ${escapeHtml(bridgeSenderName)}\n` +
+              `• <b>Loại thực tế:</b> <code>${escapeHtml(sec.detectedType ?? 'unknown')}</code> (${((sec.confidence ?? 0) * 100).toFixed(1)}%)\n` +
+              `• <b>Lý do:</b> ${escapeHtml(sec.reason ?? 'Nội dung âm thanh không hợp lệ')}\n` +
+              `• <b>SHA-256:</b> <code>${sec.sha256 ?? 'n/a'}</code>`,
+              { ...tgBase, parse_mode: 'HTML' },
+            ).catch(() => {});
+            return;
+          }
+          const stream = createReadStream(localPath);
           const sent = await tg.sendVoice(config.telegram.groupId, { source: stream }, tgOpts);
           saveTgMapping(sent);
         } finally { await cleanTemp(localPath); }
@@ -1989,6 +2156,17 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
           console.warn(`[Zalo→TG] Topic ${staleTopicId} was deleted — removing stale mapping for ${msg.threadId}`);
           store.remove(staleTopicId);
         }
+      } else if (isDownloadError(err)) {
+        // Media download exhausted all retries (ETIMEDOUT, ECONNRESET, etc.).
+        // Notify the user so the message isn't silently dropped.
+        console.warn('[ZaloHandler] Media download failed after retries:', (err as Error)?.message ?? err);
+        const staleTopicId = store.getTopicByZalo(msg.threadId, msg.type as 0 | 1);
+        if (staleTopicId !== undefined) {
+          await tg.sendMessage(config.telegram.groupId,
+            '⚠️ <i>Không thể tải media từ Zalo (lỗi mạng tạm thời). Vui lòng yêu cầu người gửi chia sẻ lại.</i>',
+            { message_thread_id: staleTopicId, parse_mode: 'HTML' })
+            .catch(notifyErr => console.error('[ZaloHandler] Failed to send media-download-failure notice:', notifyErr));
+        }
       } else {
         console.error('[ZaloHandler] Error:', err);
       }
@@ -2068,17 +2246,36 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       const topicId = store.getTopicByZalo(String(zaloId), type);
       if (topicId === undefined) return;
 
-      // Reply to the original forwarded TG message to notify it was recalled on Zalo
-      await tg.sendMessage(
-        config.telegram.groupId,
-        `<i>🗑 Tin nhắn này đã bị thu hồi trên Zalo</i>`,
-        {
-          message_thread_id: topicId,
-          parse_mode: 'HTML',
-          reply_parameters: { message_id: tgMsgId, allow_sending_without_reply: true },
-        },
-      );
-      console.log(`[ZaloHandler] Undo: notified recall for TG msg ${tgMsgId} (zaloMsgId=${zaloMsgId})`);
+      // Skip threads explicitly excluded via ZALO_EXCLUDE_THREADS or store
+      if (config.zalo.excludeThreads[`${type}:${String(zaloId)}`] || store.isExcluded(String(zaloId))) {
+        console.log(`[ZaloHandler] Undo: skip excluded thread ${zaloId}`);
+        return;
+      }
+
+      // Dedupe: the reconnect catch-up sync replays undo events that were
+      // already delivered live — skip the ones we already notified (issue #65).
+      if (!recallNotifiedStore.markIfFirst(zaloMsgId)) {
+        console.log(`[ZaloHandler] Undo: already notified for msgId=${zaloMsgId}, skipping duplicate`);
+        return;
+      }
+
+      try {
+        // Reply to the original forwarded TG message to notify it was recalled on Zalo
+        await tg.sendMessage(
+          config.telegram.groupId,
+          `<i>🗑 Tin nhắn này đã bị thu hồi trên Zalo</i>`,
+          {
+            message_thread_id: topicId,
+            parse_mode: 'HTML',
+            reply_parameters: { message_id: tgMsgId, allow_sending_without_reply: true },
+          },
+        );
+        console.log(`[ZaloHandler] Undo: notified recall for TG msg ${tgMsgId} (zaloMsgId=${zaloMsgId})`);
+      } catch (sendErr) {
+        // Notification failed — unmark so a replayed event can retry it
+        recallNotifiedStore.unmark(zaloMsgId);
+        throw sendErr;
+      }
     } catch (err) {
       console.error('[ZaloHandler] Undo error:', err);
     }
@@ -2166,6 +2363,7 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
 
       const actorUid = typeof data?.uidFrom === 'string' ? data.uidFrom.trim() : '';
       const rawName = typeof data?.dName === 'string' ? data.dName.trim() : '';
+      const actionId = typeof data?.actionId === 'string' ? data.actionId.trim() : undefined;
 
       if (reactionEventDedupeStore.isDuplicateZaloInbound({
         zaloId,
@@ -2173,8 +2371,9 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
         icon: rIcon,
         actorUid: actorUid || undefined,
         actorName: rawName || undefined,
+        actionId,
       })) {
-        console.log(`[ZaloHandler] Reaction: skip duplicate event ${zaloId}/${targetMsgIds.join('|')}/${rIcon}`);
+        console.log(`[ZaloHandler] Reaction: skip duplicate event ${zaloId}/${targetMsgIds.join('|')}/${rIcon} action=${actionId ?? '-'}`);
         return;
       }
 
@@ -2197,6 +2396,12 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       const topicId = store.getTopicByZalo(zaloId, type);
       if (topicId === undefined) return;
 
+      // Skip threads explicitly excluded via ZALO_EXCLUDE_THREADS or store
+      if (config.zalo.excludeThreads[`${type}:${zaloId}`] || store.isExcluded(zaloId)) {
+        console.log(`[ZaloHandler] Reaction: skip excluded thread ${zaloId}`);
+        return;
+      }
+
       // In 1-1 DMs, attach the reaction directly onto the Telegram message
       // (clean, no reply) — there's only one possible reactor, so no name is
       // needed. A bot reaction shows as the bot and Telegram can only hold one
@@ -2205,8 +2410,10 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       // named summary reply below, which can tell multiple reactors apart.
       // The bot's own reactions don't generate message_reaction updates, so this
       // can't echo back to Zalo. Unmappable/rejected icons also fall through.
+      // ZALO_DM_NATIVE_REACTION=0 opts out of native DM reactions and always
+      // uses the named summary reply (issue #65).
       const tgReaction = ZALO_TO_TG_REACTION[rIcon];
-      if (type === 0 && tgReaction) {
+      if (type === 0 && tgReaction && config.zalo.dmNativeReaction) {
         try {
           await tg.setMessageReaction(
             config.telegram.groupId,

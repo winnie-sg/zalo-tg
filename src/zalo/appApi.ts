@@ -146,6 +146,7 @@ export async function appGetGroupInfo(groupId: string): Promise<AppGroupData | n
           'Cookie':       buildCookieHeader(sess.cookies, url),
         },
         timeout: 15_000,
+        family:  4,
       },
     );
 
@@ -201,6 +202,7 @@ export async function appGetGroupMembersInfo(uids: string[]): Promise<Map<string
             'Cookie':       buildCookieHeader(sess.cookies, url),
           },
           timeout: 15_000,
+          family:  4,
         },
       );
 
@@ -260,6 +262,7 @@ export async function appGetReceivedFriendRequests(count = 200, offset = 0): Pro
         'Cookie': buildCookieHeader(sess.cookies, url),
       },
       timeout: 15_000,
+      family:  4,
     });
 
     if (resp.data.error_code !== 0 || !resp.data.data) {
@@ -294,6 +297,7 @@ export async function appGetSentFriendRequests(count = 200, offset = 0): Promise
         'Cookie': buildCookieHeader(sess.cookies, url),
       },
       timeout: 15_000,
+      family:  4,
     });
 
     if (resp.data.error_code !== 0 || !resp.data.data) {

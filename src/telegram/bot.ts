@@ -5,7 +5,9 @@ import { config } from '../config.js';
 
 // Force IPv4 to avoid ETIMEDOUT on systems where IPv6 is blocked/unreachable
 const agent = new https.Agent({ family: 4 });
-const localAgent = new http.Agent({ family: 4 });
+const localAgent = config.telegram.localServer?.startsWith('https://')
+  ? new https.Agent({ family: 4 })
+  : new http.Agent({ family: 4 });
 
 const BOT_COMMANDS = [
   { command: 'login',          description: 'Đăng nhập Zalo bằng QR (Web API)' },
@@ -15,7 +17,7 @@ const BOT_COMMANDS = [
   { command: 'group_info',     description: 'Xem thông tin & thành viên nhóm Zalo hiện tại' },
   { command: 'group_infoall',  description: 'Xem toàn bộ thành viên nhóm Zalo hiện tại' },
   { command: 'recall',         description: 'Thu hồi tin nhắn đã gửi sang Zalo' },
-  { command: 'topic',          description: 'Quản lý topic: list | info | delete' },
+  { command: 'topic',          description: 'Quản lý topic: list | info | pause | resume | exclude | delete' },
   { command: 'history',        description: 'Nạp lịch sử chat nhóm vào topic hiện tại' },
   { command: 'autoreply',      description: 'Tự trả lời DM khi offline: on | off | status' },
   { command: 'addgroup',       description: 'Tạo nhóm Zalo mới từ topic hiện tại' },
@@ -24,6 +26,7 @@ const BOT_COMMANDS = [
   { command: 'joingroup',      description: 'Tham gia nhóm Zalo qua link mời' },
   { command: 'leavegroup',     description: 'Rời nhóm Zalo của topic hiện tại' },
   { command: 'status',         description: 'Xem trạng thái kết nối & thống kê bridge' },
+  { command: 'setup',          description: 'Cấu hình bridge tương tác (chỉ admin)' },
   { command: 'restart',        description: 'Khởi động lại bridge (chỉ admin)' },
   { command: 'admin',          description: 'Admin panel: trạng thái, cache, tra mapping' },
   { command: 'update',         description: 'Kiểm tra bản cập nhật mới cho bridge' },

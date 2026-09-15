@@ -6,16 +6,19 @@ import { setupTelegramHandler } from './telegram/handler.js';
 import { config } from './config.js';
 import { startUpdateChecker } from './updater.js';
 import { store, userCache } from './store.js';
-import { registerShutdownHandler, requestShutdown } from './lifecycle.js';
+import { registerShutdownHandler, requestShutdown, isShutdownRequested } from './lifecycle.js';
 import { terminal } from './utils/terminal.js';
+import { logger, flush as flushLogs } from './utils/logger.js';
 
 // ── Global safety net — prevent unhandled rejections from crashing ────────────
 process.on('unhandledRejection', (reason) => {
   console.error('[Boot] Unhandled rejection (ignored):', reason);
+  logger.error('[Boot] Unhandled rejection (ignored):', reason);
 });
 process.on('uncaughtException', (err) => {
   console.error('[Boot] Uncaught exception:', err);
-  void requestShutdown('Uncaught exception', 43);
+  logger.error('[Boot] Uncaught exception:', err);
+  void flushLogs().finally(() => requestShutdown('Uncaught exception', 43));
 });
 
 // ── Module-level ref to Telegram handler's API setter (used by reconnect) ──────
@@ -99,7 +102,7 @@ async function startZalo(
       })();
     }
   }, 2 * 60 * 1000);
-  
+
   if (!_bridgeReadyAnnounced) {
     _bridgeReadyAnnounced = true;
     terminal.status('bridge', 'ready · forwarding active', 'success');
@@ -164,6 +167,58 @@ async function startZalo(
   });
 }
 
+async function launchTelegram(): Promise<void> {
+  let attempt = 0;
+  while (!isShutdownRequested()) {
+    try {
+      await tgBot.launch({ allowedUpdates: ['message', 'callback_query', 'message_reaction', 'poll_answer', 'poll'] }, () => {
+        attempt = 0;
+        terminal.status('telegram', 'polling connected', 'success');
+
+        syncTelegramCommands()
+          .then(() => terminal.status('commands', 'menu synchronized', 'success'))
+          .catch((err: unknown) => console.warn('[Boot] Failed to sync Telegram commands:', err));
+
+        // ── Attempt Zalo login in background ────────────────────────────────
+        // If credentials.json exists → connects automatically and updates currentApi.
+        // If not → notifies the user to run /login.
+        getZaloApi()
+          .then(async (api) => {
+            _setZaloApi?.(api);   // ← inject into Telegram handler so TG→Zalo works
+            await startZalo(api);
+          })
+          .catch((err: unknown) => {
+            console.warn('[Boot] Zalo auto-login failed:', err);
+            tgBot.telegram
+              .sendMessage(
+                config.telegram.groupId,
+                '⚠️ Chưa đăng nhập Zalo. Gửi <b>/login</b> để đăng nhập.',
+                { parse_mode: 'HTML' },
+              )
+              .catch(() => undefined);
+          });
+      });
+      return; // resolved — polling stopped gracefully (e.g. tgBot.stop in shutdown)
+    } catch (err) {
+      if (isShutdownRequested()) return;
+      const message = err instanceof Error ? err.message : String(err);
+      const fatal = /Bot Token is required|401|Unauthorized/i.test(message);
+      if (fatal) {
+        console.error('[Boot] Telegram polling stopped (fatal, not retrying):', err);
+        logger.error('[Boot] Telegram polling stopped (fatal, not retrying):', err);
+        void flushLogs().finally(() => requestShutdown('Telegram polling failure (fatal)', 43));
+        return;
+      }
+      attempt += 1;
+      const delay = Math.min(60_000, 1_000 * 2 ** attempt);
+      console.error(`[Boot] Telegram polling failed, retrying in ${Math.round(delay / 1000)} s:`, err);
+      logger.error('[Boot] Telegram polling failed', `retry #${attempt}`, `in ${delay}ms:`, err);
+      terminal.status('telegram', `retry #${attempt} in ${Math.round(delay / 1000)} s`, 'warn');
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+}
+
 async function main(): Promise<void> {
   await terminal.intro('1.0.0');
   terminal.installConsoleTheme();
@@ -208,6 +263,9 @@ async function main(): Promise<void> {
 
   // ── Graceful shutdown/restart shared by signals, commands and polling ──────
   registerShutdownHandler(async (reason, exitCode) => {
+    // Persist the shutdown reason to the log files before anything else.
+    logger.warn('[Shutdown]', reason, `exit ${exitCode}`);
+    void flushLogs();
     // Animate while listeners stop and debounced stores flush, so shutdown is
     // both visually smooth and operationally useful rather than a fixed delay.
     const outro = terminal.shutdown(`${reason} · exit ${exitCode}`);
@@ -223,44 +281,16 @@ async function main(): Promise<void> {
     try { await tgBot.stop(reason); } catch { /* bot may not have launched yet */ }
     // Let debounced msg/user-cache persistence finish before process exit.
     await new Promise(r => setTimeout(r, 2500));
+    await flushLogs();
     await outro;
     process.exit(exitCode);
   });
 
-  // ── Start Telegram bot so /login can be received immediately ───────────────
-  // NOTE: tgBot.launch() runs the polling loop forever, so we must NOT await it.
-  // The second argument callback fires once getMe() + deleteWebhook() succeed.
-  void tgBot.launch({ allowedUpdates: ['message', 'callback_query', 'message_reaction', 'poll_answer', 'poll'] }, () => {
-    terminal.status('telegram', 'polling connected', 'success');
-
-    syncTelegramCommands()
-      .then(() => terminal.status('commands', 'menu synchronized', 'success'))
-      .catch((err: unknown) => console.warn('[Boot] Failed to sync Telegram commands:', err));
-
-    // ── Attempt Zalo login in background ────────────────────────────────────
-    // If credentials.json exists → connects automatically and updates currentApi.
-    // If not → notifies the user to run /login.
-    getZaloApi()
-      .then(async (api) => {
-        setZaloApi(api);   // ← inject into Telegram handler so TG→Zalo works
-        await startZalo(api);
-      })
-      .catch((err: unknown) => {
-        console.warn('[Boot] Zalo auto-login failed:', err);
-        tgBot.telegram
-          .sendMessage(
-            config.telegram.groupId,
-            '⚠️ Chưa đăng nhập Zalo. Gửi <b>/login</b> để đăng nhập.',
-            { parse_mode: 'HTML' },
-          )
-          .catch(() => undefined);
-      });
-  }).catch((err: unknown) => {
-    console.error('[Boot] Telegram polling stopped:', err);
-    // Do not leave a half-alive Zalo-only bridge. A supervisor/run.sh can
-    // restart exit code 43; a direct npm start exits visibly instead of lying.
-    void requestShutdown('Telegram polling failure', 43);
-  });
+  // ── Launch Telegram with auto-retry on polling failures ───────────────────
+  // Transient network errors / Telegram hiccups no longer kill the bridge:
+  // polling restarts with exponential backoff (cap 60 s). Fatal config errors
+  // (missing token, 401) still shut down since retrying cannot fix them.
+  void launchTelegram();
 
   terminal.status('bridge', 'starting services…', 'info');
 
@@ -270,5 +300,6 @@ async function main(): Promise<void> {
 
 main().catch((err: unknown) => {
   console.error('[Boot] Fatal error:', err);
-  process.exit(1);
+  logger.error('[Boot] Fatal error:', err);
+  void flushLogs().finally(() => process.exit(1));
 });

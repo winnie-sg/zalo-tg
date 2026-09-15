@@ -7,25 +7,37 @@ bin/
 
 # Environment & secrets — KHÔNG commit các file này
 .env
+.env.*
+!.env.example
 credentials.json
 *.json.bak
+app-session.json
+**/credentials.json
+**/app-session.json
 
 # Dữ liệu runtime
 data/topics.json
 data/*.json
 data/*.json.gz
 data/bot-api/
+data/accounts/
 tmp/
 
 # Logs
 *.log
 npm-debug.log*
+logs/
 
-# macOS
+# Documentation files — ALWAYS TRACK MARKDOWN FILES
+!README.md
+!README.*.md
+!CHANGELOG.md
+!docs/**/*.md
+
+# macOS & OS artifacts
 .DS_Store
+Thumbs.db
 
 # Editor
 .vscode/
 .idea/
-logs/
-app-session.json

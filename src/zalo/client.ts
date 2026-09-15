@@ -1,7 +1,7 @@
 import { Zalo, LoginQRCallbackEventType } from 'zca-js';
 import type { LoginQRCallback } from 'zca-js';
 import { existsSync, readFileSync, statSync } from 'fs';
-import { imageSizeFromFile } from 'image-size/fromFile';
+import { imageSizeFromFile } from '../utils/media.js';
 import qrcode from 'qrcode-terminal';
 import { config } from '../config.js';
 import { writePrivateJsonFileSync } from '../utils/privateFile.js';

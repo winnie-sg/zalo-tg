@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
+import { logger } from './logger.js';
 
 const interactive = Boolean(
   process.stdout.isTTY
@@ -708,6 +709,8 @@ function addEvent(label: string, message: string, tone: Tone, method: ConsoleMet
 }
 
 function formatTaggedLog(method: ConsoleMethod, args: unknown[]): void {
+  // File logging is a separate sink; this preserves the existing TUI flow.
+  logger.fromConsole(method, args);
   const first = args[0];
   if (typeof first !== 'string') {
     if (dashboardActive && canUseDashboard()) {

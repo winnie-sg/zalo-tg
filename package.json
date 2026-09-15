@@ -10,16 +10,17 @@
     "tui:build": "go build -o bin/zalo-tg-tui ./cmd/zalo-tg-tui && GOBIN=$PWD/bin go install github.com/charmbracelet/glow@v1.5.1",
     "start": "node --disable-warning=DEP0205 dist/index.js",
     "test": "cross-env NODE_OPTIONS=--disable-warning=DEP0205 tsx --test tests/*.test.ts",
+    "logs:merge": "tsx src/tools/mergeLogs.ts",
     "check": "npm run build && npm test",
     "test:coverage": "node --disable-warning=DEP0205 --import tsx --test --experimental-test-coverage tests/*.test.ts",
     "security:audit": "npm audit --omit=dev"
   },
   "dependencies": {
     "@napi-rs/canvas": "^1.0.1",
-    "adm-zip": "^0.5.17",
-    "axios": "^1.7.2",
+    "adm-zip": "^0.6.0",
+    "axios": "^1.19.0",
     "dotenv": "^16.4.5",
-    "image-size": "^2.0.2",
+    "magika": "^1.0.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "simple-plist": "^1.3.1",
@@ -28,15 +29,19 @@
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.8",
-    "@types/image-size": "^0.7.0",
-    "@types/node": "^20.14.0",
+    "@types/node": "^22.13.10",
     "@types/qrcode": "^1.5.6",
     "@types/qrcode-terminal": "^0.12.2",
     "cross-env": "^10.1.0",
     "tsx": "^4.15.6",
     "typescript": "^5.4.5"
   },
+  "overrides": {
+    "adm-zip": "^0.6.0",
+    "axios": "^1.19.0",
+    "tar": "^7.5.3"
+  },
   "engines": {
-    "node": ">=20.11"
+    "node": ">=20.18.0 || >=22.0.0"
   }
 }

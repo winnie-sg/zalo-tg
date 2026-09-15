@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 10
     strategy:
       matrix:
-        node-version: [20, 22]
+        node-version: ['20.x', '22.x']
     env:
       TG_TOKEN: test-token
       TG_GROUP_ID: -1001

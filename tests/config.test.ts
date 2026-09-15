@@ -7,7 +7,8 @@ const cwd = path.resolve(import.meta.dirname, '..');
 
 const CONFIG_KEYS = [
   'TG_TOKEN', 'TG_GROUP_ID', 'LOCAL_BOT_API', 'TG_LOCAL_SERVER',
-  'DATA_DIR', 'ZALO_CREDENTIALS_PATH', 'ZALO_SKIP_MUTED_GROUPS', 'ZALO_MUTE_SILENT',
+  'DATA_DIR', 'ZALO_CREDENTIALS_PATH', 'ZALO_SKIP_MUTED_GROUPS', 'ZALO_MUTE_SILENT', 'ACCOUNTS',
+  'ZALO_DM_NATIVE_REACTION', 'ZALO_EXCLUDE_THREADS',
 ] as const;
 
 function runConfig(overrides: Record<string, string | undefined>) {
@@ -76,6 +77,22 @@ test('config parses boolean flags case-insensitively and keeps mute mirroring en
 
   const defaults = runConfig(valid);
   assert.equal(JSON.parse(defaults.stdout).zalo.muteSilentMirror, true);
+});
+
+test('config parses ZALO_EXCLUDE_THREADS into type:id keys and defaults bare ids to groups', () => {
+  const result = runConfig({
+    ...valid,
+    ZALO_EXCLUDE_THREADS: '0:123456789, 987654321, 1:555000111',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout).zalo.excludeThreads;
+  assert.equal(parsed['0:123456789'], true);
+  assert.equal(parsed['1:987654321'], true);
+  assert.equal(parsed['1:555000111'], true);
+  assert.equal(parsed['0:987654321'], undefined);
+
+  const empty = runConfig(valid);
+  assert.deepEqual(JSON.parse(empty.stdout).zalo.excludeThreads, {});
 });
 
 test('local Bot API mode requires a valid HTTP URL and trims trailing slashes', () => {

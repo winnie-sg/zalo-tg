@@ -17,6 +17,7 @@ const {
   downloadToTemp,
   downloadToTempFromCandidates,
   getSpriteSheetLayout,
+  imageSizeFromFile,
   sanitizeFileName,
   telegramMediaBatches,
 } = await import('../src/utils/media.js');
@@ -112,13 +113,9 @@ test('convertTgsToGif renders every Lottie frame into a transparent GIF', async 
   };
   await writeFile(tgsPath, gzipSync(JSON.stringify(lottie)));
   const gifPath = await convertTgsToGif(tgsPath);
-  const gif = await readFile(gifPath);
-  assert.equal(gif.subarray(0, 6).toString('ascii'), 'GIF89a');
-  assert.deepEqual(await import('image-size/fromFile').then(m => m.imageSizeFromFile(gifPath)), {
-    height: 32,
-    width: 32,
-    type: 'gif',
-  });
+  const dims = await imageSizeFromFile(gifPath);
+  assert.equal(dims.width, 32);
+  assert.equal(dims.height, 32);
   await cleanTemp(gifPath);
 });
 

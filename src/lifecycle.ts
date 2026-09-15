@@ -8,6 +8,11 @@ export function registerShutdownHandler(handler: ShutdownHandler): void {
   shutdownHandler = handler;
 }
 
+/** Whether a shutdown/restart has already been requested. */
+export function isShutdownRequested(): boolean {
+  return shutdownPromise !== null;
+}
+
 /** Request one idempotent graceful shutdown/restart from any module. */
 export function requestShutdown(reason: string, exitCode = 0): Promise<void> {
   if (shutdownPromise) return shutdownPromise;

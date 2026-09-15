@@ -1,9 +1,6 @@
 import 'dotenv/config';
 import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = path.resolve(__dirname, '..');
+import { PROJECT_ROOT } from './utils/paths.js';
 
 function requireEnv(key: string): string {
   const val = process.env[key];
@@ -32,6 +29,38 @@ function envFlag(key: string, defaultValue = false): boolean {
   return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 }
 
+/**
+ * Parse ZALO_EXCLUDE_THREADS: comma-separated "type:id" pairs or bare ids.
+ * type: 0 = DM, 1 = group. Bare ids are treated as groups ("1:id").
+ * Also parses legacy ZALO_EXCLUDED_GROUPS.
+ * Returns a record keyed by "type:id" so it survives JSON serialization.
+ */
+function excludeThreads(): Record<string, true> {
+  const raw = process.env.ZALO_EXCLUDE_THREADS?.trim() ?? '';
+  const out: Record<string, true> = {};
+  if (raw) {
+    for (const part of raw.split(',')) {
+      const item = part.trim();
+      if (!item) continue;
+      const m = item.match(/^(\d):(.+)$/);
+      if (m && (m[1] === '0' || m[1] === '1')) {
+        out[`${m[1]}:${m[2]}`] = true;
+      } else {
+        out[`1:${item}`] = true;
+      }
+    }
+  }
+  const rawGroups = process.env.ZALO_EXCLUDED_GROUPS?.trim() ?? '';
+  if (rawGroups) {
+    for (const part of rawGroups.split(',')) {
+      const item = part.trim();
+      if (item) {
+        out[`1:${item}`] = true;
+      }
+    }
+  }
+  return out;
+}
 
 function localBotApiServer(): string | null {
   if (!envFlag('LOCAL_BOT_API')) return null;
@@ -64,7 +93,18 @@ export const config = {
     // Telegram (messages still arrive, just no ping). On by default; set
     // ZALO_MUTE_SILENT=0 to always notify.
     muteSilentMirror: envFlag('ZALO_MUTE_SILENT', true),
+    // In 1-1 DMs, show Zalo reactions as a native Telegram reaction on the
+    // message (default). Set ZALO_DM_NATIVE_REACTION=0 to fall back to the
+    // aggregated "❤️ Name" summary reply used in groups (issue #65).
+    dmNativeReaction: envFlag('ZALO_DM_NATIVE_REACTION', true),
+    // Threads to never mirror, as "type:id" pairs (type 0=DM, 1=group).
+    // Bare ids are treated as groups. Messages from these threads are ignored.
+    excludeThreads: excludeThreads(),
     excludedGroups: (process.env.ZALO_EXCLUDED_GROUPS ?? '').split(',').map(s => s.trim()).filter(Boolean),
+  },
+  security: {
+    magikaBlockDisguised: envFlag('MAGIKA_BLOCK_DISGUISED', true),
+    magikaConfidenceThreshold: Math.max(0, Math.min(1, parseFloat(process.env.MAGIKA_CONFIDENCE_THRESHOLD || '0.80') || 0.80)),
   },
   dataDir: resolvePath(process.env.DATA_DIR, 'data'),
 } as const;

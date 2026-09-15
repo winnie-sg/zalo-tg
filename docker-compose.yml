@@ -23,7 +23,10 @@ services:
     hostname: telegram-bot-api
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${TG_LOCAL_PORT:-8081}:8081"
+      # Exposes Telegram Bot API on the host
+      - "${TG_LOCAL_PORT:-8081}:8081"
+      # Or bind to 127.0.0.1 if external access is not required:
+      # - "127.0.0.1:${TG_LOCAL_PORT:-8081}:8081"
     environment:
       TELEGRAM_API_ID:   "${TG_API_ID}"
       TELEGRAM_API_HASH: "${TG_API_HASH}"

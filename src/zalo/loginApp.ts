@@ -18,7 +18,7 @@ import path from 'node:path';
 import { writeFileSync } from 'node:fs';
 import axios, { type AxiosInstance } from 'axios';
 import { Zalo } from 'zca-js';
-import { imageSizeFromFile } from 'image-size/fromFile';
+import { imageSizeFromFile } from '../utils/media.js';
 import { statSync } from 'node:fs';
 import { config } from '../config.js';
 import { writePrivateJsonFileSync } from '../utils/privateFile.js';

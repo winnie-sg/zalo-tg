@@ -39,7 +39,7 @@ const execFileAsync = promisify(execFile);
 
 import type { ZaloAPI, ZaloMessage } from '../zalo/types.js';
 import { ZALO_MSG_TYPES } from '../zalo/types.js';
-import { store, msgStore, userCache, friendsCache, groupsCache, sentMsgStore, pollStore, mediaGroupStore, reactionEchoStore, reactionSummaryStore, reactionEventDedupeStore, aliasCache, markRecalled, type ZaloQuoteData } from '../store.js';
+import { store, msgStore, userCache, friendsCache, groupsCache, sentMsgStore, pollStore, mediaGroupStore, reactionEchoStore, reactionSummaryStore, reactionEventDedupeStore, aliasCache, markRecalled, recallNotifiedStore, type ZaloQuoteData } from '../store.js';
 import { getAutoReplyState, setAutoReplyEnabled, AUTO_REPLY_COOLDOWN_MIN, AUTO_REPLY_MAX_PER_HOUR } from '../zalo/autoReply.js';
 import { replayHistoryMessages, requestGroupHistory, queueGroupMemberScan } from '../zalo/handler.js';
 import { tgBot } from './bot.js';
@@ -51,6 +51,9 @@ import { loadAppSession, invalidateAppSession, appGetReceivedFriendRequests, app
 import { resetMemberCacheLoaded } from '../zalo/handler.js';
 import { escapeHtml } from '../utils/format.js';
 import { requestShutdown } from '../lifecycle.js';
+import { zaloApiWithRetry, isTransientNetworkError } from '../utils/zaloRetry.js';
+import { startSetupWizard, handleSetupCallback, consumeSetupTextAndAdvance, hasActiveSetup } from './setupWizard.js';
+import { inspectFileSecurity, pendingSecurityStore } from '../utils/fileSecurity.js';
 
 // Bridge start time (module load = process start)
 const _bridgeStartTime = Date.now();
@@ -229,6 +232,26 @@ function buildReplyAutoMention(
     prefix: `${mentionText} `,
     mention: { pos: 0, uid: quote.uidFrom, len: mentionText.length },
   };
+}
+
+/**
+ * Extract actual replied-to message_id from a Telegram message.
+ * Filters out topic creation root messages and forum_topic_created markers
+ * which Telegram Bot API automatically attaches to unquoted messages in forum topics.
+ */
+function getTgReplyMsgId(tgMsg: unknown, topicId?: number): number | undefined {
+  if (!tgMsg || typeof tgMsg !== 'object') return undefined;
+  const reply = (tgMsg as {
+    reply_to_message?: {
+      message_id?: number;
+      forum_topic_created?: unknown;
+      is_topic_message?: boolean;
+    };
+  }).reply_to_message;
+  if (!reply || typeof reply !== 'object' || typeof reply.message_id !== 'number') return undefined;
+  if (topicId !== undefined && reply.message_id === topicId) return undefined;
+  if (Boolean(reply.forum_topic_created)) return undefined;
+  return reply.message_id;
 }
 
 function normalizePhoneSearchQuery(query: string): string | null {
@@ -571,6 +594,28 @@ export function setupTelegramHandler(
         },
       },
     );
+  });
+
+  // /setup – interactive env wizard (bool via inline buttons, free-form via chat input)
+  tgBot.command('setup', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+    const threadId = 'message_thread_id' in ctx.message
+      ? ctx.message.message_thread_id
+      : undefined;
+    const replyOpts = threadId ? { message_thread_id: threadId } : {};
+    if (!await isTelegramGroupAdmin(ctx.from.id)) {
+      await ctx.reply('⛔ Chỉ admin Telegram mới có thể cấu hình bridge.', replyOpts);
+      return;
+    }
+    if (hasActiveSetup(ctx.from.id)) {
+      await ctx.reply('⚙️ Đang có phiên cấu hình — hoàn tất nó trước (hoặc bấm Huỷ).', replyOpts);
+      return;
+    }
+    await ctx.reply(
+      '⚙️ Bắt đầu cấu hình bridge. Trả lời từng bước — các biến boolean dùng nút bấm, các biến khác nhập tin nhắn trong nhóm.',
+      replyOpts,
+    );
+    startSetupWizard(ctx.from.id, threadId, (text, opts) => ctx.reply(text, { ...replyOpts, ...opts }));
   });
 
   // /topic – manage bridge topic mappings
@@ -1753,6 +1798,69 @@ export function setupTelegramHandler(
   tgBot.on('callback_query', async (ctx) => {
     const data = 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : undefined;
 
+    if (data?.startsWith('setup:')) {
+      const callbackMessage = ctx.callbackQuery.message;
+      const setupChatId = callbackMessage?.chat.id;
+      const setupThreadId = callbackMessage && 'message_thread_id' in callbackMessage
+        ? callbackMessage.message_thread_id
+        : undefined;
+      if (setupChatId === undefined) return;
+      const send = (text: string, opts?: object) => ctx.telegram.sendMessage(setupChatId, text, {
+        ...(setupThreadId !== undefined ? { message_thread_id: setupThreadId } : {}),
+        ...opts,
+      });
+      await handleSetupCallback(ctx, data, isTelegramGroupAdmin, send);
+      return;
+    }
+
+    if (data?.startsWith('sec_appr:') || data?.startsWith('sec_deny:')) {
+      const isApprove = data.startsWith('sec_appr:');
+      const actionId = data.slice(9);
+      if (!await isTelegramGroupAdmin(ctx.from.id)) {
+        await ctx.answerCbQuery('⛔ Chỉ quản trị viên mới có quyền duyệt tệp này!', { show_alert: true });
+        return;
+      }
+      const act = pendingSecurityStore.get(actionId);
+      if (!act) {
+        await ctx.answerCbQuery('⚠️ Yêu cầu đã hết hạn hoặc đã được xử lý trước đó.', { show_alert: true });
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => undefined);
+        return;
+      }
+      pendingSecurityStore.remove(actionId);
+
+      const adminName = ctx.from.first_name || ctx.from.username || String(ctx.from.id);
+      if (isApprove) {
+        await ctx.answerCbQuery('✅ Đã chấp nhận tệp.');
+        await ctx.editMessageText(
+          `✅ <b>[Đã phê duyệt]</b> Quản trị viên <b>${escapeHtml(adminName)}</b> đã chấp nhận gửi/tải tệp: <code>${escapeHtml(act.filename)}</code>.\n<i>Đang tiến hành xử lý chuyển tiếp...</i>`,
+          { parse_mode: 'HTML' },
+        ).catch(() => undefined);
+        try {
+          await act.executeApprove();
+          await ctx.editMessageText(
+            `✅ <b>[Đã chuyển tiếp]</b> Tệp <code>${escapeHtml(act.filename)}</code> đã được gửi thành công sau khi quản trị viên <b>${escapeHtml(adminName)}</b> phê duyệt.`,
+            { parse_mode: 'HTML' },
+          ).catch(() => undefined);
+        } catch (err) {
+          console.error('[SECURITY] Error executing approved action:', err);
+          await ctx.editMessageText(
+            `⚠️ <b>[Lỗi gửi tệp]</b> Đã phê duyệt nhưng gửi tệp <code>${escapeHtml(act.filename)}</code> thất bại: ${escapeHtml(String(err))}`,
+            { parse_mode: 'HTML' },
+          ).catch(() => undefined);
+        }
+      } else {
+        await ctx.answerCbQuery('❌ Đã từ chối và huỷ tệp.');
+        await ctx.editMessageText(
+          `❌ <b>[Đã huỷ]</b> Quản trị viên <b>${escapeHtml(adminName)}</b> đã từ chối gửi/tải tệp: <code>${escapeHtml(act.filename)}</code>. Tệp tạm đã được xoá an toàn.`,
+          { parse_mode: 'HTML' },
+        ).catch(() => undefined);
+        if (act.executeDeny) {
+          await act.executeDeny().catch(() => undefined);
+        }
+      }
+      return;
+    }
+
     if (data?.startsWith('restart:')) {
       const [, action, ownerId] = data.split(':');
       if (String(ctx.from.id) !== ownerId || !await isTelegramGroupAdmin(ctx.from.id)) {
@@ -2282,8 +2390,9 @@ export function setupTelegramHandler(
           return;
         }
         // Snapshot the reconnectable Zalo singleton so a mid-recall reconnect
-        // can't swap it out under us.
-        const api = currentApi;
+        // can't swap it out under us. Wrapped with zaloApiWithRetry so every
+        // api.* call automatically retries on transient network errors.
+        const api = zaloApiWithRetry(currentApi);
         const { ThreadType } = await import('zca-js');
         let zaloId: string | undefined;
         let threadType: 0 | 1 = 0;
@@ -2424,8 +2533,15 @@ export function setupTelegramHandler(
    * Only returns a quote if cliMsgId has been confirmed by the Zalo echo
    * (non-empty, non-"0") — otherwise Zalo rejects with code 114.
    */
-  function getZaloQuote(tgMsgId: number | undefined): SendMessageQuote | undefined {
+  /**
+   * Look up Zalo quote data for a TG reply chain.
+   * Tries msgStore first (for Zalo→TG and TG→Zalo text messages).
+   * Only returns a quote if cliMsgId has been confirmed by the Zalo echo
+   * (non-empty, non-"0") — otherwise Zalo rejects with code 114.
+   */
+  function getZaloQuote(tgMsgId: number | undefined, topicId?: number): SendMessageQuote | undefined {
     if (tgMsgId === undefined) return undefined;
+    if (topicId !== undefined && tgMsgId === topicId) return undefined;
     const fromMsgStore = msgStore.getQuote(tgMsgId);
     if (fromMsgStore) {
       // cliMsgId is empty/"0" while waiting for the Zalo echo to confirm it
@@ -2450,6 +2566,8 @@ export function setupTelegramHandler(
   }
 
   tgBot.on('message', async (ctx) => {
+    // Set by notifyError so the outer catch below doesn't double-notify.
+    let errorNotified = false;
     try {
       const msg = ctx.message;
       if (ctx.from?.is_bot) return;
@@ -2461,14 +2579,24 @@ export function setupTelegramHandler(
         'message_thread_id' in msg ? (msg.message_thread_id as number | undefined) : undefined;
       if (!topicId) return;
 
+      // Interactive setup wizard: consume free-form env values from chat input
+      if ('text' in msg && typeof msg.text === 'string' && !msg.text.startsWith('/')) {
+        if (consumeSetupTextAndAdvance(ctx.from.id, msg.text, (text, opts) =>
+          ctx.reply(text, { message_thread_id: topicId, ...opts }))) {
+          return;
+        }
+      }
+
       // Zalo not connected yet
       if (!currentApi) {
         console.warn('[TG→Zalo] currentApi is null – Zalo not connected. Ignoring message.');
         return;
       }
 
-      // Capture api reference so closures below always use the same instance
-      const api = currentApi;
+      // Capture api reference so closures below always use the same instance.
+      // Wrapped with zaloApiWithRetry so every api.* call automatically retries
+      // on transient network errors (ETIMEDOUT, ECONNRESET, ...) before giving up.
+      const api = zaloApiWithRetry(currentApi);
 
       // Look up the corresponding Zalo conversation
       const entry = store.getEntryByTopic(topicId);
@@ -2483,13 +2611,17 @@ export function setupTelegramHandler(
 
       // Helper: send TG error notification back to the same topic
       const notifyError = async (action: string, err: unknown) => {
+        errorNotified = true;
         const errMsg = err instanceof Error ? err.message : String(err);
         const code = (err as { code?: number })?.code;
         console.error(`[TG→Zalo] ${action} failed (zaloId=${zaloId}, type=${threadType}):`, err);
 
         // Provide a friendlier explanation for common Zalo error codes
         let hint = '';
-        if (code === 114) {
+        if (isTransientNetworkError(err)) {
+          // Retries exhausted — give the user actionable context
+          hint = '\n💡 <i>Lỗi mạng tạm thời — đã thử lại 4 lần nhưng không thành công. Kiểm tra kết nối mạng.</i>';
+        } else if (code === 114) {
           hint = threadType === ThreadType.User
             ? '\n💡 <i>Zalo từ chối: chưa kết bạn hoặc người dùng đã bật giới hạn tin nhắn từ người lạ.</i>'
             : '\n💡 <i>Zalo từ chối tham số (code 114).</i>';
@@ -2510,10 +2642,9 @@ export function setupTelegramHandler(
         // Skip bot commands that were already handled above
         if (msg.text.startsWith('/')) return;
         console.log(`[TG→Zalo] sendMessage → zaloId=${zaloId} type=${threadType} text="${msg.text.slice(0, 80)}"`);
-        // Look up Zalo quote data if this TG message is a reply.
-        // Tries msgStore (Zalo→TG) first, then sentMsgStore (TG→Zalo).
-        const replyToMsgId = msg.reply_to_message?.message_id;
-        const zaloQuote = getZaloQuote(replyToMsgId);
+        // Look up Zalo quote data if this TG message is a real reply (not topic root)
+        const replyToMsgId = getTgReplyMsgId(msg, topicId);
+        const zaloQuote = getZaloQuote(replyToMsgId, topicId);
 
         const _rawTextMentions = resolveTgMentions(
           msg.text,
@@ -2545,15 +2676,32 @@ export function setupTelegramHandler(
               .filter(m => m.pos >= chunkOffset && m.pos < chunkOffset + chunkText.length)
               .map(m => ({ ...m, pos: m.pos - chunkOffset }));
             const useQuote = ci === 0 ? zaloQuote : undefined;
-            const sendResult = await api.sendMessage(
-              {
-                msg: chunkText,
-                ...(useQuote ? { quote: useQuote } : {}),
-                ...(chunkMentions.length ? { mentions: chunkMentions } : {}),
-              },
-              zaloId,
-              threadType,
-            );
+            let sendResult: Awaited<ReturnType<typeof api.sendMessage>>;
+            try {
+              sendResult = await api.sendMessage(
+                {
+                  msg: chunkText,
+                  ...(useQuote ? { quote: useQuote } : {}),
+                  ...(chunkMentions.length ? { mentions: chunkMentions } : {}),
+                },
+                zaloId,
+                threadType,
+              );
+            } catch (sendErr: unknown) {
+              const errCode = (sendErr as { code?: number })?.code;
+              if (errCode === 114 && (useQuote || chunkMentions.length > 0)) {
+                console.warn(
+                  `[TG→Zalo] code 114 on sendMessage (quote=${Boolean(useQuote)}, mentions=${chunkMentions.length}), retrying as plain text without quote/mentions`,
+                );
+                sendResult = await api.sendMessage(
+                  { msg: chunkText },
+                  zaloId,
+                  threadType,
+                );
+              } else {
+                throw sendErr;
+              }
+            }
             if (ci === 0) firstResult = sendResult;
             // Space out chunks to avoid Zalo rate limiting
             if (ci < chunks.length - 1) await new Promise(r => setTimeout(r, 500));
@@ -2603,16 +2751,15 @@ export function setupTelegramHandler(
         fileSize?: number,
         caption?: string,
         captionMentions?: Array<{ pos: number; uid: string; len: number }>,
+        forceFile = false,
       ) => {
         if (fileSize !== undefined && fileSize > TG_FILE_LIMIT) {
           await notifyTooBig(filename, fileSize);
           return;
         }
-        // Pass Zalo quote if the TG message is a reply to a forwarded Zalo message
-        const replyToMsgId = 'reply_to_message' in msg
-          ? (msg as { reply_to_message?: { message_id: number } }).reply_to_message?.message_id
-          : undefined;
-        const zaloQuote = getZaloQuote(replyToMsgId);
+        // Pass Zalo quote if the TG message is a reply to a forwarded Zalo message (not topic creation root)
+        const replyToMsgId = getTgReplyMsgId(msg, topicId);
+        const zaloQuote = getZaloQuote(replyToMsgId, topicId);
         let fileLink: URL;
         try {
           fileLink = await ctx.telegram.getFileLink(fileId);
@@ -2642,6 +2789,97 @@ export function setupTelegramHandler(
           }
         }
         const localPath = await downloadToTemp(fileLink.toString(), filename);
+
+        // Security check: inspect file with Magika to prevent disguised payloads
+        const secCheck = await inspectFileSecurity(localPath, filename);
+        if (secCheck.requiresApproval) {
+          console.warn(`[SECURITY] File requires approval: "${filename}" -> detected "${secCheck.detectedType}" (confidence: ${secCheck.confidence}, SHA-256: ${secCheck.sha256})`);
+          const effectiveForceFile = forceFile || secCheck.forceDocFallback;
+
+          const pendingAction = pendingSecurityStore.add({
+            direction: 'tg_to_zalo',
+            filename,
+            localPath,
+            topicId,
+            zaloId,
+            threadType,
+            secCheck,
+            executeApprove: async () => {
+              sentMsgStore.markSending(zaloId);
+              try {
+                const effectiveCaption = caption ?? '';
+                let attachmentSource: AttachmentSource[] = [localPath];
+                const ext = path.extname(filename).slice(1).toLowerCase();
+                if (effectiveForceFile || !['jpg', 'jpeg', 'png', 'webp', 'gif', 'mp4'].includes(ext)) {
+                  const fileBuffer = await readFile(localPath);
+                  attachmentSource = [{
+                    data: fileBuffer,
+                    filename: filename as `${string}.${string}`,
+                    metadata: { totalSize: fileBuffer.length },
+                  }];
+                }
+                const sendResult = await api.sendMessage(
+                  {
+                    msg: effectiveCaption,
+                    attachments: attachmentSource,
+                    ...(effectiveCaption.length && zaloQuote ? { quote: zaloQuote } : {}),
+                    ...(captionMentions?.length ? { mentions: captionMentions } : {}),
+                  },
+                  zaloId,
+                  threadType,
+                );
+                const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
+                if (zaloMsgId !== undefined) {
+                  sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
+                  const ownUid = String(api.getOwnId?.() ?? '');
+                  msgStore.save(msg.message_id, [String(zaloMsgId)], {
+                    msgId: String(zaloMsgId),
+                    cliMsgId: '',
+                    uidFrom: ownUid,
+                    ts: String(Math.floor(Date.now() / 1000)),
+                    msgType: 'webchat',
+                    content: caption ?? '',
+                    ttl: 0,
+                    zaloId,
+                    threadType: entry.type,
+                  });
+                }
+              } finally {
+                sentMsgStore.unmarkSending(zaloId);
+                await cleanTemp(localPath);
+              }
+            },
+            executeDeny: async () => {
+              await cleanTemp(localPath);
+            },
+          });
+
+          await ctx.telegram.sendMessage(
+            config.telegram.groupId,
+            `⚠️ <b>[Cảnh báo bảo mật tệp]</b>\n\n` +
+            `Tệp gửi từ Telegram có dấu hiệu định dạng không khớp hoặc độ tin cậy thấp:\n` +
+            `• <b>Tệp:</b> <code>${escapeHtml(filename)}</code>\n` +
+            `• <b>Loại khai báo:</b> <code>${escapeHtml(secCheck.declaredType ?? 'unknown')}</code>\n` +
+            `• <b>Loại thực tế phát hiện:</b> <code>${escapeHtml(secCheck.detectedType ?? 'unknown')}</code> (${((secCheck.confidence ?? 0) * 100).toFixed(1)}%)\n` +
+            `• <b>Lý do:</b> ${escapeHtml(secCheck.reason ?? 'Nội dung tệp không khớp với phần mở rộng')}\n` +
+            `• <b>SHA-256:</b> <code>${secCheck.sha256 ?? 'n/a'}</code>\n\n` +
+            `<i>Quản trị viên vui lòng xác nhận chuyển tiếp tệp này sang Zalo hay huỷ bỏ:</i>`,
+            {
+              message_thread_id: topicId,
+              parse_mode: 'HTML',
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    { text: '✅ Tiếp tục gửi sang Zalo', callback_data: `sec_appr:${pendingAction.id}` },
+                    { text: '❌ Huỷ & Xoá tệp', callback_data: `sec_deny:${pendingAction.id}` },
+                  ],
+                ],
+              },
+            },
+          ).catch(() => {});
+          return;
+        }
+
         sentMsgStore.markSending(zaloId);
         try {
           console.log(`[TG→Zalo] Sending ${filename} → zaloId=${zaloId} type=${threadType}`);
@@ -2654,7 +2892,9 @@ export function setupTelegramHandler(
           const effectiveCaption = caption ?? '';
 
           let attachmentSource: AttachmentSource[] = [localPath];
-          if (!['jpg', 'jpeg', 'png', 'webp', 'gif', 'mp4'].includes(path.extname(filename).slice(1).toLowerCase())) {
+          const ext = path.extname(filename).slice(1).toLowerCase();
+          const canForceFile = ext === 'mp4';
+          if (!['jpg', 'jpeg', 'png', 'webp', 'gif', 'mp4'].includes(ext) || (forceFile && canForceFile)) {
             const fileBuffer = await readFile(localPath);
             attachmentSource = [{
               data: fileBuffer,
@@ -2716,9 +2956,7 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
       };
 
       // Compute auto-mention once for this entire message (reply → prepend @Name)
-      const _captionReplyMsgId = ('reply_to_message' in msg
-        ? (msg as { reply_to_message?: { message_id: number } }).reply_to_message?.message_id
-        : undefined);
+      const _captionReplyMsgId = getTgReplyMsgId(msg, topicId);
       const _autoMentionForMedia = buildReplyAutoMention(_captionReplyMsgId, threadType);
 
       // Helper: extract caption + resolved mentions from any media message
@@ -2777,7 +3015,23 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
                 let fileLink: URL;
                 try { fileLink = await tgBot.telegram.getFileLink(item.fileId); }
                 catch { continue; }
-                photoPaths.push(await downloadToTemp(fileLink.toString(), item.fname));
+                const lp = await downloadToTemp(fileLink.toString(), item.fname);
+                const sec = await inspectFileSecurity(lp, item.fname);
+                if (!sec.safe) {
+                  console.warn(`[SECURITY] MediaGroup: blocked disguised photo "${item.fname}" -> detected "${sec.detectedType}"`);
+                  await tgBot.telegram.sendMessage(
+                    config.telegram.groupId,
+                    `⚠️ <b>[Cảnh báo bảo mật] Đã bỏ qua ảnh giả mạo trong album</b>\n\n` +
+                    `• <b>Tệp:</b> <code>${escapeHtml(item.fname)}</code>\n` +
+                    `• <b>Loại thực tế:</b> <code>${escapeHtml(sec.detectedType ?? 'unknown')}</code> (${((sec.confidence ?? 0) * 100).toFixed(1)}%)\n` +
+                    `• <b>Lý do:</b> ${escapeHtml(sec.reason ?? 'Nội dung tệp không hợp lệ')}\n` +
+                    `• <b>SHA-256:</b> <code>${sec.sha256 ?? 'n/a'}</code>`,
+                    { message_thread_id: meta.topicId, parse_mode: 'HTML' },
+                  ).catch(() => {});
+                  await cleanTemp(lp);
+                  continue;
+                }
+                photoPaths.push(lp);
                 if (item.tgMsgId !== undefined) photoTgIds.push(item.tgMsgId);
               }
               if (photoPaths.length > 0) {
@@ -2833,6 +3087,21 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
               const localVideoPath = await downloadToTemp(fileLink.toString(), item.fname);
               let localThumbPath: string | undefined;
               try {
+                const sec = await inspectFileSecurity(localVideoPath, item.fname);
+                if (!sec.safe) {
+                  console.warn(`[SECURITY] MediaGroup video: blocked disguised video "${item.fname}" -> detected "${sec.detectedType}"`);
+                  await tgBot.telegram.sendMessage(
+                    config.telegram.groupId,
+                    `⚠️ <b>[Cảnh báo bảo mật] Đã chặn gửi video giả mạo</b>\n\n` +
+                    `• <b>Tệp:</b> <code>${escapeHtml(item.fname)}</code>\n` +
+                    `• <b>Loại thực tế:</b> <code>${escapeHtml(sec.detectedType ?? 'unknown')}</code> (${((sec.confidence ?? 0) * 100).toFixed(1)}%)\n` +
+                    `• <b>Lý do:</b> ${escapeHtml(sec.reason ?? 'Nội dung video không hợp lệ')}\n` +
+                    `• <b>SHA-256:</b> <code>${sec.sha256 ?? 'n/a'}</code>`,
+                    { message_thread_id: meta.topicId, parse_mode: 'HTML' },
+                  ).catch(() => {});
+                  continue;
+                }
+
                 try { localThumbPath = await extractVideoThumbnail(localVideoPath); } catch { /* no thumb */ }
                 const videoUploads: any[] = await api.uploadAttachment([localVideoPath], meta.zaloId, threadType);
                 const videoUpload = videoUploads?.find((r: { fileType?: string }) => r.fileType === 'video') as { fileUrl?: string } | undefined;
@@ -2901,7 +3170,7 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
         const { cap, capMentions } = getCaptionMentions();
         const mediaGroupId = ('media_group_id' in msg ? (msg as { media_group_id?: string }).media_group_id : undefined);
         if (mediaGroupId) {
-          const replyToMsgId = msg.reply_to_message?.message_id;
+          const replyToMsgId = getTgReplyMsgId(msg, topicId);
           mediaGroupStore.add(
             mediaGroupId,
             { fileId: photo.file_id, fname: 'photo.jpg', fileSize: photo.file_size, caption: cap, captionMentions: capMentions, tgMsgId: msg.message_id },
@@ -2927,7 +3196,15 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
         const doc   = msg.document;
         const fname = doc.file_name ?? `file_${Date.now()}.bin`;
         const { cap, capMentions } = getCaptionMentions();
-        await sendAttachment(doc.file_id, fname, doc.file_size, cap, capMentions);
+        await sendAttachment(doc.file_id, fname, doc.file_size, cap, capMentions, true);
+        return;
+      }
+
+      if ('audio' in msg && msg.audio) {
+        const aud   = msg.audio;
+        const fname = aud.file_name ?? `audio_${Date.now()}.mp3`;
+        const { cap, capMentions } = getCaptionMentions();
+        await sendAttachment(aud.file_id, fname, aud.file_size, cap, capMentions);
         return;
       }
 
@@ -2937,7 +3214,7 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
         const { cap, capMentions } = getCaptionMentions();
         const mediaGroupId = ('media_group_id' in msg ? (msg as { media_group_id?: string }).media_group_id : undefined);
         if (mediaGroupId) {
-          const replyToMsgId = msg.reply_to_message?.message_id;
+          const replyToMsgId = getTgReplyMsgId(msg, topicId);
           mediaGroupStore.add(
             mediaGroupId,
             { fileId: vid.file_id, fname, fileSize: vid.file_size, caption: cap, captionMentions: capMentions, tgMsgId: msg.message_id, isVideo: true, videoWidth: vid.width, videoHeight: vid.height, videoDuration: vid.duration },
@@ -2962,6 +3239,23 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
         const localVideoPath = await downloadToTemp(fileLink.toString(), fname);
         let localThumbPath: string | undefined;
         try {
+          const secCheck = await inspectFileSecurity(localVideoPath, fname);
+          if (!secCheck.safe) {
+            console.warn(`[SECURITY] Blocked disguised video from TG: "${fname}" -> detected "${secCheck.detectedType}" (confidence: ${secCheck.confidence}, SHA-256: ${secCheck.sha256})`);
+            await ctx.telegram.sendMessage(
+              config.telegram.groupId,
+              `⚠️ <b>[Cảnh báo bảo mật] Đã chặn gửi video giả mạo</b>\n\n` +
+              `• <b>Tệp:</b> <code>${escapeHtml(fname)}</code>\n` +
+              `• <b>Loại khai báo:</b> <code>${escapeHtml(secCheck.declaredType ?? 'unknown')}</code>\n` +
+              `• <b>Loại thực tế phát hiện:</b> <code>${escapeHtml(secCheck.detectedType ?? 'unknown')}</code> (${((secCheck.confidence ?? 0) * 100).toFixed(1)}%)\n` +
+              `• <b>Lý do:</b> ${escapeHtml(secCheck.reason ?? 'Nội dung video không hợp lệ')}\n` +
+              `• <b>SHA-256:</b> <code>${secCheck.sha256 ?? 'n/a'}</code>\n\n` +
+              `<i>Tệp đã bị huỷ chuyển tiếp sang Zalo để bảo vệ an toàn.</i>`,
+              { message_thread_id: topicId, parse_mode: 'HTML' },
+            ).catch(() => {});
+            return;
+          }
+
           // Extract first frame as thumbnail
           try { localThumbPath = await extractVideoThumbnail(localVideoPath); } catch { /* no thumb */ }
 
@@ -3049,6 +3343,21 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
         const oggPath  = await downloadToTemp(fileLink.toString(), `voice_${Date.now()}.ogg`);
         let m4aPath: string | undefined;
         try {
+          const secCheck = await inspectFileSecurity(oggPath, `voice_${Date.now()}.ogg`);
+          if (!secCheck.safe) {
+            console.warn(`[SECURITY] Blocked disguised voice from TG -> detected "${secCheck.detectedType}"`);
+            await ctx.telegram.sendMessage(
+              config.telegram.groupId,
+              `⚠️ <b>[Cảnh báo bảo mật] Đã chặn gửi tin nhắn thoại giả mạo</b>\n\n` +
+              `• <b>Loại thực tế phát hiện:</b> <code>${escapeHtml(secCheck.detectedType ?? 'unknown')}</code> (${((secCheck.confidence ?? 0) * 100).toFixed(1)}%)\n` +
+              `• <b>Lý do:</b> ${escapeHtml(secCheck.reason ?? 'Nội dung âm thanh không hợp lệ')}\n` +
+              `• <b>SHA-256:</b> <code>${secCheck.sha256 ?? 'n/a'}</code>\n\n` +
+              `<i>Tin nhắn thoại đã bị huỷ chuyển tiếp sang Zalo để bảo vệ an toàn.</i>`,
+              { message_thread_id: topicId, parse_mode: 'HTML' },
+            ).catch(() => {});
+            return;
+          }
+
           m4aPath = await convertToM4a(oggPath);
           // Upload to Zalo CDN to get a voiceUrl
           const uploaded = await api.uploadAttachment(m4aPath, zaloId, threadType) as Array<{ fileUrl?: string }>;
@@ -3338,6 +3647,23 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
       }
     } catch (err) {
       console.error('[TG→Zalo] Error:', err);
+      // Surface unhandled send failures to the user instead of silently dropping
+      // the message (issue #65). Inner handlers that already notified set
+      // errorNotified so we don't send a second warning for the same message.
+      if (!errorNotified) {
+        const failedTopicId =
+          ctx.message && 'message_thread_id' in ctx.message
+            ? (ctx.message.message_thread_id as number | undefined)
+            : undefined;
+        if (failedTopicId) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          await tgBot.telegram.sendMessage(
+            config.telegram.groupId,
+            `⚠️ Gửi thất bại: <b>gửi sang Zalo</b>\n<code>${escapeHtml(errMsg)}</code>`,
+            { message_thread_id: failedTopicId, parse_mode: 'HTML' },
+          ).catch(() => undefined);
+        }
+      }
     }
   });
 
@@ -3384,7 +3710,7 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
       if (!poll.is_closed) return;
       const entry = pollStore.getByTgPollUUID(poll.id);
       if (!entry || !currentApi) return;
-      await doLockPoll(entry, currentApi);
+      await doLockPoll(entry, zaloApiWithRetry(currentApi));
     } catch (err) {
       console.error('[TG→Zalo] lockPoll error:', err);
     }
@@ -3412,7 +3738,7 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
       }
 
       if (!currentApi) return;
-      const api = currentApi;
+      const api = zaloApiWithRetry(currentApi);
 
       // Map TG 0-based option indices → Zalo option_ids
       const optionIds = answer.option_ids

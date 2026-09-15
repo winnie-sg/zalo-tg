@@ -18,6 +18,7 @@ const {
   reactionEchoStore,
   reactionEventDedupeStore,
   reactionSummaryStore,
+  recallNotifiedStore,
   sentMsgStore,
   store,
   userCache,
@@ -199,11 +200,45 @@ test('reactionEventDedupeStore normalizes target order and actor names', () => {
   assert.equal(second, true);
 });
 
+test('reactionEventDedupeStore counts repeated actions by actionId and dedupes replays of the same action', () => {
+  // Repeated identical tap → new actionId → NOT a duplicate
+  assert.equal(
+    reactionEventDedupeStore.isDuplicateZaloInbound({ zaloId: 'g', targetMsgIds: ['m'], icon: '/-heart', actionId: 'act-1' }),
+    false,
+  );
+  assert.equal(
+    reactionEventDedupeStore.isDuplicateZaloInbound({ zaloId: 'g', targetMsgIds: ['m'], icon: '/-heart', actionId: 'act-2' }),
+    false,
+  );
+  // Same action re-emitted later (reconnect replay) → duplicate
+  assert.equal(
+    reactionEventDedupeStore.isDuplicateZaloInbound({ zaloId: 'g', targetMsgIds: ['m'], icon: '/-heart', actionId: 'act-1' }),
+    true,
+  );
+});
+
+test('reactionSummaryStore counts repeated same-emoji reactions per actor', () => {
+  const entry = reactionSummaryStore.upsert(9402, '❤️', 'Alice');
+  reactionSummaryStore.upsert(9402, '❤️', 'Alice');
+  reactionSummaryStore.upsert(9402, '❤️', 'Alice');
+  reactionSummaryStore.upsert(9402, '👍', 'Alice');
+  assert.equal(reactionSummaryStore.buildText(entry), '❤️ ×3 Alice  👍 Alice');
+});
+
+test('recallNotifiedStore suppresses duplicate recall notifications and allows re-mark after unmark', () => {
+  assert.equal(recallNotifiedStore.markIfFirst('recall-1'), true);
+  assert.equal(recallNotifiedStore.markIfFirst('recall-1'), false);
+  assert.equal(recallNotifiedStore.markIfFirst('recall-2'), true);
+  recallNotifiedStore.unmark('recall-1');
+  assert.equal(recallNotifiedStore.markIfFirst('recall-1'), true);
+  assert.equal(recallNotifiedStore.markIfFirst('recall-1'), false);
+});
+
 test('reactionSummaryStore does not duplicate the same actor per emoji', () => {
   const entry = reactionSummaryStore.upsert(9401, '❤️', 'Alice');
   reactionSummaryStore.upsert(9401, '❤️', 'Alice');
   reactionSummaryStore.upsert(9401, '👍', 'Bob');
-  assert.equal(reactionSummaryStore.buildText(entry), '❤️ Alice  👍 Bob');
+  assert.equal(reactionSummaryStore.buildText(entry), '❤️ ×2 Alice  👍 Bob');
 });
 
 test('pollStore removes stale Telegram and UUID indexes when a poll is replaced', () => {
@@ -214,6 +249,7 @@ test('pollStore removes stale Telegram and UUID indexes when a poll is replaced'
     tgPollUUID: 'uuid-old',
     tgScoreMsgId: 9521,
     tgThreadId: 9531,
+    createdAt: Date.now(),
     options: [{ option_id: 1, content: 'A' }],
   });
   pollStore.save({
@@ -223,6 +259,7 @@ test('pollStore removes stale Telegram and UUID indexes when a poll is replaced'
     tgPollUUID: 'uuid-new',
     tgScoreMsgId: 9522,
     tgThreadId: 9531,
+    createdAt: Date.now(),
     options: [{ option_id: 1, content: 'A' }],
   });
   assert.equal(pollStore.getByTgMsgId(9511), undefined);
@@ -231,6 +268,22 @@ test('pollStore removes stale Telegram and UUID indexes when a poll is replaced'
   assert.equal(pollStore.getByTgPollUUID('uuid-new')?.pollId, 9501);
 });
 
+
+test('pollStore removes expired local mappings but keeps current mappings', () => {
+  const now = Date.now();
+  pollStore.save({
+    pollId: 9551,
+    zaloGroupId: 'g',
+    tgPollMsgId: 9552,
+    tgPollUUID: 'uuid-expired',
+    tgScoreMsgId: 9553,
+    tgThreadId: 9554,
+    createdAt: now - 61 * 24 * 60 * 60 * 1_000,
+    options: [{ option_id: 1, content: 'Old' }],
+  });
+  assert.equal(pollStore.pruneExpired(now), 1);
+  assert.equal(pollStore.getByPollId(9551), undefined);
+});
 test('debounced msgStore persistence writes a gzip payload', async () => {
   msgStore.save(9601, ['persist-id'], quote('persist-id'));
   await new Promise(resolve => setTimeout(resolve, 1200));

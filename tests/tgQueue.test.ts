@@ -60,3 +60,31 @@ test('tgQueue retries Telegram 429 responses', async () => {
   assert.equal(result, 'ok');
   assert.equal(attempts, 2);
 });
+
+test('tgQueue retries transient network errors (socket hang up) then succeeds', async () => {
+  let attempts = 0;
+  const result = await tgQueue(async () => {
+    attempts++;
+    if (attempts === 1) {
+      throw new Error('request to https://api.telegram.org/bot/sendPhoto failed, reason: socket hang up');
+    }
+    return 'ok';
+  });
+  assert.equal(result, 'ok');
+  assert.equal(attempts, 2);
+});
+
+test('tgQueue does not transient-retry permanent Telegram errors', async () => {
+  let attempts = 0;
+  const err = Object.assign(new Error('400: Bad Request: message text is empty'), {
+    response: { error_code: 400, description: 'Bad Request: message text is empty' },
+  });
+  await assert.rejects(
+    tgQueue(async () => {
+      attempts++;
+      throw err;
+    }),
+    err,
+  );
+  assert.equal(attempts, 1);
+});
