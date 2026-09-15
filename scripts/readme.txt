@@ -1,0 +1,1 @@
+this ss for windows only, planning to move to script on all in upcoming update
