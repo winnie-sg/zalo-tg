@@ -33,10 +33,9 @@ export function sanitizeFileName(fileName: string, fallback = `download_${Date.n
   return cleaned || fallback;
 }
 
-/** Download a remote URL to a temp file. Returns the local file path.
- *  When using a local Telegram Bot API server (--local flag), getFileLink()
- *  returns a file:// URL pointing to the server's working directory.
- *  In that case we copy the file directly instead of downloading via HTTP.
+/** Download a remote URL or local file URL to a temp file. Returns the local file path.
+ *  Local Telegram Bot API paths are normalized to hostless file:// URLs before
+ *  they reach this function; copy those files directly instead of using HTTP.
  */
 export async function downloadToTemp(url: string, fileName?: string, retries = 3): Promise<string> {
   if (!Number.isInteger(retries) || retries < 1) {

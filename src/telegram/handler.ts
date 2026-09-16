@@ -54,6 +54,7 @@ import { requestShutdown } from '../lifecycle.js';
 import { zaloApiWithRetry, isTransientNetworkError } from '../utils/zaloRetry.js';
 import { startSetupWizard, handleSetupCallback, consumeSetupTextAndAdvance, hasActiveSetup } from './setupWizard.js';
 import { inspectFileSecurity, pendingSecurityStore } from '../utils/fileSecurity.js';
+import { resolveTelegramFileLink } from './fileLink.js';
 
 // Bridge start time (module load = process start)
 const _bridgeStartTime = Date.now();
@@ -2762,7 +2763,7 @@ export function setupTelegramHandler(
         const zaloQuote = getZaloQuote(replyToMsgId, topicId);
         let fileLink: URL;
         try {
-          fileLink = await ctx.telegram.getFileLink(fileId);
+          fileLink = await resolveTelegramFileLink(ctx.telegram, fileId, config.telegram.localServer);
         } catch (err: unknown) {
           const msg2 = err instanceof Error ? err.message : String(err);
           if (msg2.includes('file is too big')) { await notifyTooBig(filename, fileSize); return; }
@@ -3013,7 +3014,7 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
             try {
               for (const item of groupedItems) {
                 let fileLink: URL;
-                try { fileLink = await tgBot.telegram.getFileLink(item.fileId); }
+                try { fileLink = await resolveTelegramFileLink(tgBot.telegram, item.fileId, config.telegram.localServer); }
                 catch { continue; }
                 const lp = await downloadToTemp(fileLink.toString(), item.fname);
                 const sec = await inspectFileSecurity(lp, item.fname);
@@ -3082,7 +3083,7 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
           if (videoItems.length > 0) {
             for (const item of videoItems) {
               let fileLink: URL;
-              try { fileLink = await tgBot.telegram.getFileLink(item.fileId); }
+              try { fileLink = await resolveTelegramFileLink(tgBot.telegram, item.fileId, config.telegram.localServer); }
               catch { continue; }
               const localVideoPath = await downloadToTemp(fileLink.toString(), item.fname);
               let localThumbPath: string | undefined;
@@ -3230,7 +3231,7 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
           return;
         }
         let fileLink: URL;
-        try { fileLink = await ctx.telegram.getFileLink(vid.file_id); }
+        try { fileLink = await resolveTelegramFileLink(ctx.telegram, vid.file_id, config.telegram.localServer); }
         catch (err: unknown) {
           const isTooBig = err instanceof Error && err.message.includes('file is too big');
           if (isTooBig) { await notifyTooBig(fname, vid.file_size); return; }
@@ -3334,7 +3335,7 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
         }
         // Download OGG from TG, convert to M4A, upload to Zalo, send as voice bubble
         let fileLink: URL;
-        try { fileLink = await ctx.telegram.getFileLink(msg.voice.file_id); }
+        try { fileLink = await resolveTelegramFileLink(ctx.telegram, msg.voice.file_id, config.telegram.localServer); }
         catch (err: unknown) {
           const isTooBig = err instanceof Error && err.message.includes('file is too big');
           if (isTooBig) { await notifyTooBig(`voice_${Date.now()}.ogg`, msg.voice.file_size); return; }
@@ -3431,7 +3432,7 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
           let webmPath: string | null = null;
           let gifPath:  string | null = null;
           try {
-            const fileLink = await ctx.telegram.getFileLink(sticker.file_id);
+            const fileLink = await resolveTelegramFileLink(ctx.telegram, sticker.file_id, config.telegram.localServer);
             webmPath = await downloadToTemp(fileLink.toString(), `sticker_${Date.now()}.webm`);
             gifPath  = await convertWebmToGif(webmPath);
             await sendRenderedSticker(gifPath);
@@ -3450,7 +3451,7 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
           let tgsPath: string | null = null;
           let gifPath: string | null = null;
           try {
-            const fileLink = await ctx.telegram.getFileLink(sticker.file_id);
+            const fileLink = await resolveTelegramFileLink(ctx.telegram, sticker.file_id, config.telegram.localServer);
             tgsPath = await downloadToTemp(fileLink.toString(), `sticker_${Date.now()}.tgs`);
             gifPath = await convertTgsToGif(tgsPath);
             await sendRenderedSticker(gifPath);
@@ -3468,7 +3469,7 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
           let webpPath: string | null = null;
           let pngPath: string | null = null;
           try {
-            const fileLink = await ctx.telegram.getFileLink(sticker.file_id);
+            const fileLink = await resolveTelegramFileLink(ctx.telegram, sticker.file_id, config.telegram.localServer);
             webpPath = await downloadToTemp(fileLink.toString(), `sticker_${Date.now()}.webp`);
             pngPath = await convertStickerToPng(webpPath);
             await sendRenderedSticker(pngPath);
